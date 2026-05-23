@@ -65,6 +65,23 @@ UNSUPPORTED_EXECUTION_REPLY = (
 )
 
 
+TOOL_RISK_BY_PERMISSION: Dict[str, str] = {
+    "tool_read": "low",
+    "file_read": "low",
+    "kb_read": "low",
+    "skill_read": "low",
+    "nlp_local": "low",
+    "data_exec": "low",
+    "ml_plan": "low",
+    "ml_eval": "low",
+    "ml_train": "medium",
+    "report_write": "medium",
+    "kb_write": "medium",
+    "file_write": "medium",
+    "skill_install": "high",
+}
+
+
 def default_general_chat_payload() -> Dict[str, Any]:
     return {
         "reply": DEFAULT_CLARIFICATION_REPLY,
@@ -484,6 +501,7 @@ class MemoryStore:
     - session: short-turn history
     - workflow: task-level artifacts
     - knowledge: long-term docs/snippets
+    - experience: reusable solved-problem summaries and skill hints
     - profile: user preferences
     """
 
@@ -492,6 +510,7 @@ class MemoryStore:
             "session": {},
             "workflow": {},
             "knowledge": {},
+            "experience": {},
             "profile": {},
         }
 
@@ -514,6 +533,21 @@ class MemoryStore:
             return []
         return messages[-max(1, limit):]
 
+    def append_workflow_event(self, trace_id: str, event: Dict[str, Any]) -> None:
+        key = f"events::{trace_id}"
+        row = self._data["workflow"].setdefault(key, {"events": []})
+        events = row.setdefault("events", [])
+        events.append(event)
+        if len(events) > 200:
+            row["events"] = events[-200:]
+
+    def get_workflow_events(self, trace_id: str, limit: int = 40) -> List[Dict[str, Any]]:
+        row = self._data["workflow"].get(f"events::{trace_id}", {"events": []})
+        events = row.get("events", [])
+        if not isinstance(events, list):
+            return []
+        return events[-max(1, limit):]
+
     def put_knowledge_doc(self, doc_id: str, title: str, text: str, source: str) -> None:
         self._data["knowledge"][doc_id] = {
             "doc_id": doc_id,
@@ -522,6 +556,47 @@ class MemoryStore:
             "source": source,
             "updated_at_ms": now_ms(),
         }
+
+    def put_experience(self, exp_id: str, entry: Dict[str, Any]) -> None:
+        row = dict(entry)
+        row.setdefault("experience_id", exp_id)
+        row.setdefault("created_at_ms", now_ms())
+        row["updated_at_ms"] = now_ms()
+        self._data["experience"][exp_id] = row
+
+    def recent_experiences(self, limit: int = 10) -> List[Dict[str, Any]]:
+        rows = list(self._data["experience"].values())
+        rows.sort(key=lambda x: x.get("created_at_ms", 0), reverse=True)
+        return rows[: max(1, min(limit, 100))]
+
+    def all_experiences(self) -> List[Dict[str, Any]]:
+        rows = list(self._data["experience"].values())
+        rows.sort(key=lambda x: x.get("created_at_ms", 0))
+        return rows
+
+    def search_experiences(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+        q = (query or "").lower().strip()
+        if not q:
+            return self.recent_experiences(limit=top_k)
+        terms = [t for t in re.split(r"[\s,.;:!?，。；：！？、/\\-]+", q) if len(t) >= 2]
+        if not terms:
+            terms = [q]
+        scored: List[Tuple[int, Dict[str, Any]]] = []
+        for row in self._data["experience"].values():
+            text = "\n".join(
+                [
+                    str(row.get("problem", "")),
+                    str(row.get("goal", "")),
+                    str(row.get("summary", "")),
+                    str(row.get("skill_candidate", {}).get("name", "")),
+                    " ".join([str(x) for x in row.get("executed_tools", [])]),
+                ]
+            ).lower()
+            score = sum(text.count(term) for term in terms)
+            if score > 0:
+                scored.append((score, row))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [x[1] for x in scored[: max(1, min(top_k, 50))]]
 
     def search(self, namespace: str, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
         self._must_namespace(namespace)
@@ -573,6 +648,9 @@ class ToolRegistry:
         spec = self.tools[name]
         return spec.func(**kwargs)
 
+    def get_spec(self, name: str) -> Optional[ToolSpec]:
+        return self.tools.get(name)
+
     def list_tools(self) -> List[Dict[str, Any]]:
         out = []
         for spec in self.tools.values():
@@ -583,6 +661,7 @@ class ToolRegistry:
                     "input_schema": spec.input_schema,
                     "examples": spec.examples,
                     "permission": spec.permission,
+                    "risk_level": TOOL_RISK_BY_PERMISSION.get(spec.permission, "medium"),
                     "owner_agent": spec.owner_agent,
                     "timeout_s": spec.timeout_s,
                     "retry": spec.retry,
@@ -599,6 +678,7 @@ class ToolRegistry:
                     "description": spec.description,
                     "input_schema": spec.input_schema,
                     "permission": spec.permission,
+                    "risk_level": TOOL_RISK_BY_PERMISSION.get(spec.permission, "medium"),
                 }
             )
         return rows
@@ -744,15 +824,256 @@ class Scheduler:
         self.waiting = still_waiting
 
 
+class ExecutionPolicy:
+    """
+    Codex-inspired safety gate:
+    - categorize tool calls by risk
+    - enforce explicit approval for high-risk actions
+    - return machine-readable decision for orchestrator
+    """
+
+    def __init__(self):
+        self._risk_by_permission = dict(TOOL_RISK_BY_PERMISSION)
+
+    def risk_level(self, permission: str) -> str:
+        return self._risk_by_permission.get(permission, "medium")
+
+    def evaluate(self, tool_name: str, spec: ToolSpec, args: Dict[str, Any], task: str) -> Dict[str, Any]:
+        risk = self.risk_level(spec.permission)
+        approved = parse_bool(args.get("approved"), default=False)
+        task_l = task.lower()
+        if not approved and risk == "high":
+            approved = ("approve" in task_l and tool_name.lower() in task_l) or ("approved" in task_l)
+
+        if risk == "high" and not approved:
+            return {
+                "allow": False,
+                "risk": risk,
+                "reason": (
+                    f"Tool `{tool_name}` is high risk ({spec.permission}). "
+                    "Add `approved=true` for this tool call or explicitly approve in your request."
+                ),
+            }
+
+        return {
+            "allow": True,
+            "risk": risk,
+            "reason": "allowed",
+        }
+
+
+class ExperienceAgent(BaseAgent):
+    """
+    Captures solved-problem experience and proposes reusable skill candidates.
+    Persists entries under `.skills/experience_catalog.json`.
+    """
+
+    def __init__(self, memory: MemoryStore, workspace: str, model: str = "gpt-4o"):
+        super().__init__("experience_agent")
+        self.memory = memory
+        self.workspace = Path(workspace).expanduser().resolve()
+        self.model = model
+        self.catalog_path = self.workspace / ".skills" / "experience_catalog.json"
+        self.catalog_path.parent.mkdir(parents=True, exist_ok=True)
+        self.client = None
+        api_key = os.getenv("OPENAI_API_KEY", "").strip()
+        if api_key:
+            try:
+                from openai import OpenAI
+
+                self.client = OpenAI(api_key=api_key)
+            except Exception:
+                self.client = None
+        self._load_catalog()
+
+    def handle(self, message: Message, state: State) -> Message:
+        payload = message.get("content", {})
+        entry = self.summarize_and_store(
+            session_id=str(payload.get("session_id", state.get("session_id", "default"))),
+            trace_id=str(payload.get("trace_id", state.get("trace_id", f"trace_{now_ms()}"))),
+            task=str(payload.get("task", "")),
+            response=ensure_dict(payload.get("response", {})),
+            loop_state=ensure_dict(payload.get("loop_state", {})),
+        )
+        return {
+            "sender": self.name,
+            "receiver": payload.get("return_to", "user"),
+            "type": "experience_logged",
+            "priority": 55,
+            "content": {"experience": entry},
+            "metadata": {"trace_id": state.get("trace_id", "")},
+        }
+
+    def _load_catalog(self) -> None:
+        if not self.catalog_path.exists():
+            return
+        try:
+            data = json.loads(self.catalog_path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        entries = data.get("experiences", []) if isinstance(data, dict) else []
+        if not isinstance(entries, list):
+            return
+        for row in entries:
+            if not isinstance(row, dict):
+                continue
+            exp_id = str(row.get("experience_id", "")).strip()
+            if not exp_id:
+                continue
+            self.memory.put_experience(exp_id, row)
+
+    def _save_catalog(self) -> None:
+        payload = {
+            "updated_at_ms": now_ms(),
+            "experiences": self.memory.all_experiences()[-500:],
+        }
+        self.catalog_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _llm_experience_summary(
+        self,
+        task: str,
+        response: Dict[str, Any],
+        loop_state: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        if self.client is None:
+            return None
+        system_prompt = (
+            "You are an experience mining module. "
+            "Convert one solved run into reusable engineering experience. "
+            "Return strict JSON."
+        )
+        payload = {
+            "task": task,
+            "response": {
+                "intent": response.get("intent"),
+                "status": response.get("status"),
+                "summary": truncate_text(response.get("result_summary") or response.get("reply", ""), max_chars=1200),
+                "executed_tools": response.get("executed_tools", []),
+            },
+            "observations": loop_state.get("observations", [])[-8:],
+            "output_schema": {
+                "problem": "string",
+                "summary": "string",
+                "what_worked": ["string"],
+                "what_failed": ["string"],
+                "playbook_steps": ["string"],
+                "skill_candidate": {
+                    "name": "string",
+                    "description": "string",
+                    "when_to_use": "string",
+                    "tool_chain": ["string"],
+                },
+            },
+        }
+        try:
+            resp = self.client.responses.create(
+                model=self.model,
+                input=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                ],
+                temperature=0,
+            )
+            parsed = _extract_json_object(getattr(resp, "output_text", "") or "")
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            return None
+        return None
+
+    def summarize_and_store(
+        self,
+        session_id: str,
+        trace_id: str,
+        task: str,
+        response: Dict[str, Any],
+        loop_state: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        loop_state = loop_state or {}
+        executed_tools = response.get("executed_tools", []) or loop_state.get("executed_tools", [])
+        if not isinstance(executed_tools, list):
+            executed_tools = []
+        observations = loop_state.get("observations", []) if isinstance(loop_state.get("observations"), list) else []
+        failures = [str(row.get("error", "")) for row in observations if isinstance(row, dict) and not row.get("ok", True)]
+        failures = [x for x in failures if x][:6]
+        plan = response.get("plan", []) or loop_state.get("plan", [])
+        if not isinstance(plan, list):
+            plan = []
+
+        llm_row = self._llm_experience_summary(task=task, response=response, loop_state=loop_state) or {}
+        summary = str(llm_row.get("summary", "")).strip() or truncate_text(
+            response.get("result_summary") or response.get("reply", "No summary."),
+            max_chars=1200,
+        )
+        what_worked = llm_row.get("what_worked", [])
+        if not isinstance(what_worked, list) or not what_worked:
+            what_worked = [f"Executed tool: {tool}" for tool in executed_tools[:8]]
+
+        what_failed = llm_row.get("what_failed", [])
+        if not isinstance(what_failed, list) or not what_failed:
+            what_failed = failures or []
+
+        playbook_steps = llm_row.get("playbook_steps", [])
+        if not isinstance(playbook_steps, list) or not playbook_steps:
+            playbook_steps = [str(x) for x in plan[:10] if str(x).strip()]
+
+        skill_candidate = llm_row.get("skill_candidate", {})
+        if not isinstance(skill_candidate, dict) or not skill_candidate:
+            top_tool = executed_tools[0] if executed_tools else "general_workflow"
+            skill_candidate = {
+                "name": f"skill_{top_tool}".lower(),
+                "description": "Reusable workflow learned from solved user requests.",
+                "when_to_use": "Use when a new task has similar goal and tool pattern.",
+                "tool_chain": executed_tools[:8],
+            }
+
+        exp_id = f"exp_{now_ms()}"
+        entry = {
+            "experience_id": exp_id,
+            "session_id": session_id,
+            "trace_id": trace_id,
+            "problem": str(llm_row.get("problem", "")).strip() or task,
+            "goal": response.get("goal", ""),
+            "intent": response.get("intent", "GENERAL_CHAT"),
+            "status": response.get("status", response.get("planner_mode", "unknown")),
+            "summary": summary,
+            "what_worked": [str(x).strip() for x in what_worked if str(x).strip()][:10],
+            "what_failed": [str(x).strip() for x in what_failed if str(x).strip()][:10],
+            "playbook_steps": [str(x).strip() for x in playbook_steps if str(x).strip()][:12],
+            "executed_tools": [str(x) for x in executed_tools][:12],
+            "skill_candidate": {
+                "name": str(skill_candidate.get("name", "skill_general")).strip() or "skill_general",
+                "description": str(skill_candidate.get("description", "Reusable skill candidate")).strip(),
+                "when_to_use": str(skill_candidate.get("when_to_use", "When similar requests appear")).strip(),
+                "tool_chain": [str(x) for x in skill_candidate.get("tool_chain", executed_tools)][:12]
+                if isinstance(skill_candidate.get("tool_chain", executed_tools), list)
+                else [str(x) for x in executed_tools][:12],
+            },
+            "created_at_ms": now_ms(),
+        }
+        self.memory.put_experience(exp_id, entry)
+        self._save_catalog()
+        return entry
+
+
 class DynamicLoopOrchestrator:
     """
     Goal -> Understand -> Plan -> Tool Calling -> Observation -> Memory/State -> Continue/Finish
     """
 
-    def __init__(self, model: str, tools: ToolRegistry, memory: MemoryStore, workspace: str):
+    def __init__(
+        self,
+        model: str,
+        tools: ToolRegistry,
+        memory: MemoryStore,
+        workspace: str,
+        experience_agent: Optional[ExperienceAgent] = None,
+    ):
         self.model = model
         self.tools = tools
         self.memory = memory
+        self.experience_agent = experience_agent
+        self.policy = ExecutionPolicy()
         self.workspace = Path(workspace).expanduser().resolve()
         self.client = None
         api_key = os.getenv("OPENAI_API_KEY", "").strip()
@@ -766,6 +1087,48 @@ class DynamicLoopOrchestrator:
 
     def available(self) -> bool:
         return self.client is not None
+
+    def _get_installed_skills(self) -> List[Dict[str, Any]]:
+        if "skill_list_installed" not in self.tools.tools:
+            return []
+        try:
+            row = self.tools.execute("skill_list_installed")
+            skills = row.get("skills", [])
+            if isinstance(skills, list):
+                return [s for s in skills if isinstance(s, dict)][:20]
+        except Exception:
+            return []
+        return []
+
+    def _record_event(self, trace_id: str, phase: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        event = {
+            "ts_ms": now_ms(),
+            "phase": phase,
+            "payload": payload,
+        }
+        self.memory.append_workflow_event(trace_id, event)
+        return event
+
+    def _capture_experience(
+        self,
+        session_id: str,
+        trace_id: str,
+        task: str,
+        response: Dict[str, Any],
+        loop_state: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        if self.experience_agent is None:
+            return None
+        try:
+            return self.experience_agent.summarize_and_store(
+                session_id=session_id,
+                trace_id=trace_id,
+                task=task,
+                response=response,
+                loop_state=loop_state,
+            )
+        except Exception:
+            return None
 
     def _llm_json(self, system_prompt: str, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if self.client is None:
@@ -889,6 +1252,8 @@ class DynamicLoopOrchestrator:
         }
 
     def understand_goal(self, task: str, recent_messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+        installed_skills = self._get_installed_skills()
+        recent_experiences = self.memory.recent_experiences(limit=5)
         system_prompt = (
             "You are the Goal Understanding module. "
             "Understand user intent semantically, then propose an adaptive execution plan. "
@@ -899,6 +1264,8 @@ class DynamicLoopOrchestrator:
             "task": task,
             "recent_messages": recent_messages[-8:],
             "tool_catalog": self.tools.catalog_for_planner(),
+            "installed_skills": installed_skills,
+            "recent_experiences": recent_experiences,
             "output_schema": {
                 "mode": "CHAT | EXECUTE",
                 "goal": "string",
@@ -918,6 +1285,8 @@ class DynamicLoopOrchestrator:
                 "Use EXECUTE when tool calling is needed; use CHAT for pure discussion or clarification.",
                 "Plan must be dynamic and task-specific. Avoid fixed template plans.",
                 "Only use tools from tool_catalog.",
+                "If installed_skills are relevant, reflect that in plan steps.",
+                "If recent_experiences are relevant, reuse successful tool chains and avoid known failure patterns.",
                 "If information is insufficient, set mode=CHAT and ask one focused clarification.",
             ],
         }
@@ -1155,13 +1524,29 @@ class DynamicLoopOrchestrator:
             out.pop("text", None)
         return out
 
-    def run(self, task: str, trace_id: str, recent_messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def run(
+        self,
+        task: str,
+        trace_id: str,
+        recent_messages: List[Dict[str, Any]],
+        session_id: str = "default",
+    ) -> Dict[str, Any]:
         understanding = self.understand_goal(task, recent_messages)
+        start_event = self._record_event(
+            trace_id,
+            "understand",
+            {
+                "mode": understanding.get("mode", "CHAT"),
+                "goal": understanding.get("goal", ""),
+                "plan_steps": len(understanding.get("plan", [])),
+            },
+        )
         mode = understanding.get("mode", "CHAT")
         plan = understanding.get("plan", [])
 
         if mode != "EXECUTE":
             reply = understanding.get("final_reply") or understanding.get("clarification_question") or DEFAULT_CLARIFICATION_REPLY
+            self._record_event(trace_id, "finish", {"status": "chat", "reason": "mode_not_execute"})
             return {
                 "intent": "GENERAL_CHAT",
                 "reply": reply,
@@ -1169,6 +1554,7 @@ class DynamicLoopOrchestrator:
                 "planner_mode": mode,
                 "goal": understanding.get("goal", ""),
                 "trace_id": trace_id,
+                "event_log_tail": self.memory.get_workflow_events(trace_id, limit=12),
             }
 
         loop_state: Dict[str, Any] = {
@@ -1183,6 +1569,7 @@ class DynamicLoopOrchestrator:
             "observations": [],
             "executed_tools": [],
             "status": "running",
+            "events": [start_event],
         }
 
         max_iterations = 12
@@ -1190,11 +1577,23 @@ class DynamicLoopOrchestrator:
         for iteration in range(1, max_iterations + 1):
             decision = self.decide_next_action(loop_state)
             loop_state["last_decision"] = decision
+            decision_event = self._record_event(
+                trace_id,
+                "decision",
+                {
+                    "iteration": iteration,
+                    "decision": decision.get("decision", "UNKNOWN"),
+                    "tool_name": decision.get("tool_name", ""),
+                    "step": decision.get("step", ""),
+                },
+            )
+            loop_state["events"].append(decision_event)
 
             if decision.get("decision") == "FINAL":
                 loop_state["status"] = "completed"
                 answer = decision.get("final_answer") or self._compose_final_answer(loop_state)
-                return {
+                self._record_event(trace_id, "finish", {"status": "completed", "iteration": iteration})
+                response = {
                     "intent": "DYNAMIC_EXECUTION",
                     "status": "completed",
                     "goal": loop_state["goal"],
@@ -1203,35 +1602,68 @@ class DynamicLoopOrchestrator:
                     "observations": loop_state["observations"][-8:],
                     "result_summary": answer,
                     "trace_id": trace_id,
+                    "event_log_tail": self.memory.get_workflow_events(trace_id, limit=20),
                 }
+                exp = self._capture_experience(
+                    session_id=session_id,
+                    trace_id=trace_id,
+                    task=task,
+                    response=response,
+                    loop_state=loop_state,
+                )
+                if exp:
+                    response["experience_id"] = exp.get("experience_id")
+                    response["skill_candidate"] = exp.get("skill_candidate", {})
+                return response
 
             if decision.get("decision") == "CLARIFY":
                 loop_state["status"] = "clarification_needed"
                 question = decision.get("clarification_question") or "Please share one missing constraint so I can continue."
-                return {
+                self._record_event(trace_id, "finish", {"status": "clarify", "iteration": iteration})
+                response = {
                     "intent": "GENERAL_CHAT",
                     "reply": question,
                     "suggestions": DEFAULT_CLARIFICATION_SUGGESTIONS,
                     "planner_mode": "CLARIFY",
                     "goal": loop_state["goal"],
                     "trace_id": trace_id,
+                    "event_log_tail": self.memory.get_workflow_events(trace_id, limit=20),
                 }
+                self._capture_experience(
+                    session_id=session_id,
+                    trace_id=trace_id,
+                    task=task,
+                    response=response,
+                    loop_state=loop_state,
+                )
+                return response
 
             if decision.get("decision") != "TOOL":
                 loop_state["status"] = "completed"
-                return {
+                self._record_event(trace_id, "finish", {"status": "unknown_decision", "iteration": iteration})
+                response = {
                     "intent": "GENERAL_CHAT",
                     "reply": DEFAULT_CLARIFICATION_REPLY,
                     "suggestions": DEFAULT_CLARIFICATION_SUGGESTIONS,
                     "planner_mode": "UNKNOWN",
                     "goal": loop_state["goal"],
                     "trace_id": trace_id,
+                    "event_log_tail": self.memory.get_workflow_events(trace_id, limit=20),
                 }
+                self._capture_experience(
+                    session_id=session_id,
+                    trace_id=trace_id,
+                    task=task,
+                    response=response,
+                    loop_state=loop_state,
+                )
+                return response
 
             tool_name = str(decision.get("tool_name", "")).strip()
             raw_args = ensure_dict(decision.get("arguments", {}))
             args = self._resolve_arguments(raw_args, task=task, tool_outputs=loop_state["tool_outputs"])
-            if tool_name not in self.tools.tools:
+            spec = self.tools.get_spec(tool_name)
+            if spec is None:
                 obs = {
                     "iteration": iteration,
                     "step": decision.get("step", "Run tool"),
@@ -1242,21 +1674,96 @@ class DynamicLoopOrchestrator:
                     "result": {},
                 }
                 loop_state["observations"].append(obs)
+                loop_state["events"].append(
+                    self._record_event(
+                        trace_id,
+                        "observation",
+                        {"iteration": iteration, "tool": tool_name, "ok": False, "error": obs["error"]},
+                    )
+                )
                 continue
+
+            policy_result = self.policy.evaluate(tool_name=tool_name, spec=spec, args=args, task=task)
+            if not policy_result.get("allow", False):
+                obs = {
+                    "iteration": iteration,
+                    "step": decision.get("step", "Run tool"),
+                    "tool": tool_name,
+                    "arguments": args,
+                    "ok": False,
+                    "error": policy_result.get("reason", "blocked by policy"),
+                    "risk": policy_result.get("risk", "unknown"),
+                    "result": {"ok": False, "error": policy_result.get("reason", "blocked by policy")},
+                }
+                loop_state["observations"].append(obs)
+                loop_state["events"].append(
+                    self._record_event(
+                        trace_id,
+                        "policy_block",
+                        {
+                            "iteration": iteration,
+                            "tool": tool_name,
+                            "risk": policy_result.get("risk", "unknown"),
+                            "reason": policy_result.get("reason", ""),
+                        },
+                    )
+                )
+                response = {
+                    "intent": "GENERAL_CHAT",
+                    "reply": policy_result.get("reason", "Blocked by policy."),
+                    "suggestions": [
+                        "Provide explicit approval if you want to run this high-risk action.",
+                        "Or ask me to continue with a lower-risk plan.",
+                    ],
+                    "planner_mode": "POLICY_BLOCK",
+                    "goal": loop_state["goal"],
+                    "trace_id": trace_id,
+                    "event_log_tail": self.memory.get_workflow_events(trace_id, limit=20),
+                }
+                self._capture_experience(
+                    session_id=session_id,
+                    trace_id=trace_id,
+                    task=task,
+                    response=response,
+                    loop_state=loop_state,
+                )
+                return response
 
             call_sig = f"{tool_name}:{json.dumps(args, ensure_ascii=False, sort_keys=True)}"
             repeated_calls[call_sig] = repeated_calls.get(call_sig, 0) + 1
             if repeated_calls[call_sig] > 2:
                 loop_state["status"] = "clarification_needed"
-                return {
+                self._record_event(trace_id, "finish", {"status": "repeat_guard", "iteration": iteration, "tool": tool_name})
+                response = {
                     "intent": "GENERAL_CHAT",
                     "reply": "I am repeating the same failing action. Please provide an additional constraint or expected output format.",
                     "suggestions": DEFAULT_CLARIFICATION_SUGGESTIONS,
                     "planner_mode": "REPEAT_GUARD",
                     "goal": loop_state["goal"],
                     "trace_id": trace_id,
+                    "event_log_tail": self.memory.get_workflow_events(trace_id, limit=20),
                 }
+                self._capture_experience(
+                    session_id=session_id,
+                    trace_id=trace_id,
+                    task=task,
+                    response=response,
+                    loop_state=loop_state,
+                )
+                return response
 
+            loop_state["events"].append(
+                self._record_event(
+                    trace_id,
+                    "tool_call",
+                    {
+                        "iteration": iteration,
+                        "tool": tool_name,
+                        "risk": policy_result.get("risk", "unknown"),
+                        "arguments_preview": to_json_text(args, max_chars=350),
+                    },
+                )
+            )
             try:
                 result = self.tools.execute(tool_name, **args)
                 ok = not (isinstance(result, dict) and result.get("ok") is False)
@@ -1277,14 +1784,29 @@ class DynamicLoopOrchestrator:
                     "arguments": args,
                     "ok": ok,
                     "error": error,
+                    "risk": policy_result.get("risk", "unknown"),
                     "result": compact_result,
                     "result_preview": to_json_text(compact_result, max_chars=900),
                 }
             )
+            loop_state["events"].append(
+                self._record_event(
+                    trace_id,
+                    "observation",
+                    {
+                        "iteration": iteration,
+                        "tool": tool_name,
+                        "ok": ok,
+                        "error": error,
+                        "result_preview": to_json_text(compact_result, max_chars=350),
+                    },
+                )
+            )
             loop_state["plan_cursor"] = int(loop_state.get("plan_cursor", 0)) + 1
 
         loop_state["status"] = "max_iterations"
-        return {
+        self._record_event(trace_id, "finish", {"status": "max_iterations"})
+        response = {
             "intent": "DYNAMIC_EXECUTION",
             "status": "max_iterations_reached",
             "goal": loop_state["goal"],
@@ -1293,7 +1815,19 @@ class DynamicLoopOrchestrator:
             "observations": loop_state["observations"][-8:],
             "result_summary": self._compose_final_answer(loop_state),
             "trace_id": trace_id,
+            "event_log_tail": self.memory.get_workflow_events(trace_id, limit=20),
         }
+        exp = self._capture_experience(
+            session_id=session_id,
+            trace_id=trace_id,
+            task=task,
+            response=response,
+            loop_state=loop_state,
+        )
+        if exp:
+            response["experience_id"] = exp.get("experience_id")
+            response["skill_candidate"] = exp.get("skill_candidate", {})
+        return response
 
 
 class IntentRouterAgent(BaseAgent):
@@ -1999,6 +2533,12 @@ def build_tool_registry(memory: MemoryStore, workspace: str) -> ToolRegistry:
     def list_available_tools() -> Dict[str, Any]:
         return {"tools": tools.list_tools()}
 
+    def experience_recent(limit: int = 10) -> Dict[str, Any]:
+        return {"experiences": memory.recent_experiences(limit=limit)}
+
+    def experience_search(query: str, top_k: int = 5) -> Dict[str, Any]:
+        return {"experiences": memory.search_experiences(query=query, top_k=top_k)}
+
     def read_document_file(path: str) -> Dict[str, Any]:
         if not path:
             return {"ok": False, "error": "path is required"}
@@ -2245,6 +2785,26 @@ def build_tool_registry(memory: MemoryStore, workspace: str) -> ToolRegistry:
             input_schema={},
             permission="tool_read",
             owner_agent="supervisor",
+        )
+    )
+    tools.register(
+        ToolSpec(
+            name="experience_recent",
+            func=experience_recent,
+            description="List recent solved-problem experiences.",
+            input_schema={"limit": "int"},
+            permission="kb_read",
+            owner_agent="experience_agent",
+        )
+    )
+    tools.register(
+        ToolSpec(
+            name="experience_search",
+            func=experience_search,
+            description="Search reusable experiences by semantic-like term matching.",
+            input_schema={"query": "string", "top_k": "int"},
+            permission="kb_read",
+            owner_agent="experience_agent",
         )
     )
     tools.register(
@@ -2507,8 +3067,14 @@ class MultiAgentSystem:
         loaded = load_markdown_as_knowledge(self.memory, self.workspace)
         self.memory.put("workflow", "bootstrap", {"knowledge_docs_loaded": loaded})
         router_model = os.getenv("ROUTER_MODEL", "gpt-4o")
+        experience_model = os.getenv("EXPERIENCE_MODEL", router_model)
         self.understanding_engine = RequestUnderstandingEngine(model=router_model, workspace=self.workspace)
         self.tools = build_tool_registry(self.memory, workspace=self.workspace)
+        self.experience_agent = ExperienceAgent(
+            memory=self.memory,
+            workspace=self.workspace,
+            model=experience_model,
+        )
         self.agents: Dict[str, BaseAgent] = {
             "intent_router": IntentRouterAgent(self.understanding_engine),
             "kb_retriever": KBRetrieverAgent(self.tools),
@@ -2520,6 +3086,7 @@ class MultiAgentSystem:
             "trainer": TrainerAgent(self.tools),
             "evaluator": EvaluatorAgent(self.tools),
             "reporter": ReporterAgent(self.tools),
+            "experience_agent": self.experience_agent,
         }
         self.supervisor = Supervisor(self.agents)
         orchestrator_model = os.getenv("ORCHESTRATOR_MODEL", router_model)
@@ -2528,6 +3095,7 @@ class MultiAgentSystem:
             tools=self.tools,
             memory=self.memory,
             workspace=self.workspace,
+            experience_agent=self.experience_agent,
         )
 
     def run(self, user_text: str, session_id: str = "default") -> Tuple[Message, State]:
@@ -2545,6 +3113,7 @@ class MultiAgentSystem:
             task=user_text,
             trace_id=trace_id,
             recent_messages=recent_messages,
+            session_id=session_id,
         )
         message: Message = {
             "sender": "dynamic_orchestrator",

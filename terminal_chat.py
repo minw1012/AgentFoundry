@@ -118,6 +118,13 @@ class ChatResponder:
                 lines.append("")
                 lines.append("Result:")
                 lines.append(summary)
+            exp_id = result.get("experience_id")
+            if exp_id:
+                lines.append("")
+                lines.append(f"Experience logged: {exp_id}")
+                skill = result.get("skill_candidate", {})
+                if isinstance(skill, dict) and skill.get("name"):
+                    lines.append(f"Skill candidate: {skill.get('name')}")
             observations = result.get("observations", [])
             if observations:
                 lines.append("")
@@ -129,6 +136,12 @@ class ChatResponder:
                         lines.append(f"{i}. {tool}: ok")
                     else:
                         lines.append(f"{i}. {tool}: failed ({row.get('error', 'unknown error')})")
+            events = result.get("event_log_tail", [])
+            if events:
+                phases = [str(e.get("phase", "")) for e in events if isinstance(e, dict) and e.get("phase")]
+                if phases:
+                    lines.append("")
+                    lines.append("Event phases: " + " -> ".join(phases[-8:]))
             return "\n".join(lines)
         if intent == "DOC_SUMMARY":
             if not result.get("ok", True):

@@ -47,7 +47,12 @@ flowchart TD
   - `session`: multi-turn conversation history.
   - `workflow`: trace-level execution state and artifacts.
   - `knowledge`: searchable documentation/history.
+  - `experience`: solved-case summaries and reusable skill hints.
   - `profile`: reserved for user preferences/policies.
+
+- `ExperienceAgent`
+  - Synthesizes each run into reusable experience entries.
+  - Persists entries and supports future retrieval.
 
 - `MultiAgentSystem.run()`
   - Uses dynamic loop by default.
@@ -107,6 +112,8 @@ The system now supports broader tool families so the planner can compose workflo
 ### C. Knowledge Memory
 - `kb_search`
 - `kb_add_document`
+- `experience_recent`
+- `experience_search`
 
 ### D. ML Workflow Blocks
 - `process_data`
