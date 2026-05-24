@@ -12,6 +12,10 @@ import os
 import re
 import subprocess
 import time
+import urllib.request
+import urllib.parse
+import urllib.error
+import ipaddress
 import zipfile
 from html import unescape
 from pathlib import Path
@@ -57,6 +61,9 @@ DEFAULT_CLARIFICATION_SUGGESTIONS = [
     "Run KNOWLEDGE_LOOKUP for historical policy updates about onboarding",
     "Run DOC_SUMMARY for /path/to/file.docx or /path/to/file.pdf",
     "Run CODE_TASK to inspect/update project files and run tests in workspace",
+    "Use network_http_request to call an API endpoint",
+    "Use sqlite_query on a local .db file for data inspection",
+    "Use browser_open_page to inspect page state and links",
     "/file summarize /path/to/file.docx",
     "/file summarize /path/to/file.pdf",
     'Use explicit JSON command: {"intent":"ML_WORKFLOW","mode":"EXECUTE","requirements":{...}}',
@@ -64,7 +71,7 @@ DEFAULT_CLARIFICATION_SUGGESTIONS = [
 
 UNSUPPORTED_EXECUTION_REPLY = (
     "This request is outside the currently executable pipeline. "
-    "Current executable scope: KNOWLEDGE_LOOKUP, DOC_SUMMARY, CODE_TASK, and tabular ML workflow."
+    "Current executable scope: KNOWLEDGE_LOOKUP, DOC_SUMMARY, CODE_TASK, tabular ML workflow, network/API calls, sqlite queries, and lightweight browser actions."
 )
 
 
@@ -73,11 +80,18 @@ TOOL_RISK_BY_PERMISSION: Dict[str, str] = {
     "file_read": "low",
     "kb_read": "low",
     "skill_read": "low",
+    "observe_read": "low",
+    "network_read": "medium",
+    "db_read": "medium",
+    "browser_read": "medium",
     "nlp_local": "low",
     "data_exec": "low",
     "ml_plan": "low",
     "ml_eval": "low",
     "ml_train": "medium",
+    "network_write": "high",
+    "db_write": "high",
+    "browser_action": "high",
     "report_write": "medium",
     "kb_write": "medium",
     "file_write": "medium",
@@ -97,27 +111,74 @@ def _normalize_name(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", text.lower())
 
 
+def _dedupe_keep_order(items: List[str]) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for item in items:
+        key = item.strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out
+
+
+def _extract_path_candidates(text: str, extensions: List[str]) -> List[str]:
+    if not text:
+        return []
+    ext_group = "|".join([re.escape(ext.lstrip(".")) for ext in extensions if ext])
+    if not ext_group:
+        return []
+
+    candidates: List[str] = []
+
+    # Quoted paths, can include spaces.
+    quoted = re.findall(rf"[\"']([^\"']+\.(?:{ext_group}))[\"']", text, flags=re.IGNORECASE)
+    candidates.extend(quoted)
+
+    # Absolute paths, allow spaces, stop at extension.
+    abs_paths = re.findall(rf"(/[^\"']+\.(?:{ext_group}))", text, flags=re.IGNORECASE)
+    candidates.extend(abs_paths)
+
+    # Simple relative tokens without spaces.
+    rel_tokens = re.findall(rf"(?:^|\s)([^\"'\s]+\.(?:{ext_group}))(?=$|\s)", text, flags=re.IGNORECASE)
+    candidates.extend(rel_tokens)
+
+    cleaned: List[str] = []
+    for raw in candidates:
+        token = str(raw).strip()
+        token = token.strip("()[]{}<>")
+        token = token.rstrip(".,;:!?")
+        if token:
+            cleaned.append(token)
+    return _dedupe_keep_order(cleaned)
+
+
+def _resolve_existing_path(candidate: str, workspace: Optional[str] = None) -> Optional[str]:
+    token = (candidate or "").strip()
+    if not token:
+        return None
+    p = Path(token).expanduser()
+    if not p.is_absolute() and workspace:
+        p = Path(workspace).expanduser() / p
+    try:
+        p = p.resolve()
+    except Exception:
+        return None
+    if p.exists() and p.is_file():
+        return str(p)
+    return None
+
+
 def resolve_document_path_from_text(task: str, workspace: Optional[str] = None) -> Optional[str]:
     text = task.strip()
     if not text:
         return None
 
-    # Absolute path with supported extension.
-    abs_match = re.search(r"(/[^\"'\s]+?\.(?:pdf|docx|txt|md))", text, flags=re.IGNORECASE)
-    if abs_match:
-        p = Path(abs_match.group(1)).expanduser().resolve()
-        if p.exists() and p.is_file():
-            return str(p)
-
-    # Quoted path with spaces.
-    quoted = re.findall(r"[\"']([^\"']+\.(?:pdf|docx|txt|md))[\"']", text, flags=re.IGNORECASE)
-    for q in quoted:
-        p = Path(q).expanduser()
-        if not p.is_absolute() and workspace:
-            p = Path(workspace) / p
-        p = p.resolve()
-        if p.exists() and p.is_file():
-            return str(p)
+    for candidate in _extract_path_candidates(text, extensions=["pdf", "docx", "txt", "md"]):
+        resolved = _resolve_existing_path(candidate, workspace=workspace)
+        if resolved:
+            return resolved
 
     if not workspace:
         return None
@@ -126,7 +187,12 @@ def resolve_document_path_from_text(task: str, workspace: Optional[str] = None) 
     if not ws.exists():
         return None
 
-    candidates = list(ws.glob("*.pdf")) + list(ws.glob("*.docx")) + list(ws.glob("*.txt")) + list(ws.glob("*.md"))
+    candidates = (
+        list(ws.rglob("*.pdf"))
+        + list(ws.rglob("*.docx"))
+        + list(ws.rglob("*.txt"))
+        + list(ws.rglob("*.md"))
+    )
     if not candidates:
         return None
 
@@ -150,22 +216,10 @@ def resolve_spreadsheet_path_from_text(task: str, workspace: Optional[str] = Non
     if not text:
         return None
 
-    # Absolute path with supported extension.
-    abs_match = re.search(r"(/[^\"'\s]+?\.(?:csv|xlsx))", text, flags=re.IGNORECASE)
-    if abs_match:
-        p = Path(abs_match.group(1)).expanduser().resolve()
-        if p.exists() and p.is_file():
-            return str(p)
-
-    # Quoted path with spaces.
-    quoted = re.findall(r"[\"']([^\"']+\.(?:csv|xlsx))[\"']", text, flags=re.IGNORECASE)
-    for q in quoted:
-        p = Path(q).expanduser()
-        if not p.is_absolute() and workspace:
-            p = Path(workspace) / p
-        p = p.resolve()
-        if p.exists() and p.is_file():
-            return str(p)
+    for candidate in _extract_path_candidates(text, extensions=["csv", "xlsx"]):
+        resolved = _resolve_existing_path(candidate, workspace=workspace)
+        if resolved:
+            return resolved
 
     if not workspace:
         return None
@@ -174,7 +228,7 @@ def resolve_spreadsheet_path_from_text(task: str, workspace: Optional[str] = Non
     if not ws.exists():
         return None
 
-    candidates = list(ws.glob("*.csv")) + list(ws.glob("*.xlsx"))
+    candidates = list(ws.rglob("*.csv")) + list(ws.rglob("*.xlsx"))
     if not candidates:
         return None
 
@@ -686,14 +740,46 @@ class MemoryStore:
             return []
         return events[-max(1, limit):]
 
-    def put_knowledge_doc(self, doc_id: str, title: str, text: str, source: str) -> None:
-        self._data["knowledge"][doc_id] = {
+    def put_knowledge_doc(
+        self,
+        doc_id: str,
+        title: str,
+        text: str,
+        source: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        row = {
             "doc_id": doc_id,
             "title": title,
             "text": text,
             "source": source,
             "updated_at_ms": now_ms(),
         }
+        if isinstance(metadata, dict):
+            row["metadata"] = dict(metadata)
+        self._data["knowledge"][doc_id] = row
+
+    def get_knowledge_doc(self, doc_id: str) -> Optional[Dict[str, Any]]:
+        row = self._data["knowledge"].get(doc_id)
+        if isinstance(row, dict):
+            return dict(row)
+        return None
+
+    def list_knowledge_sources(self, limit: int = 100) -> List[Dict[str, Any]]:
+        rows = list(self._data["knowledge"].values())
+        rows.sort(key=lambda x: x.get("updated_at_ms", 0), reverse=True)
+        out = []
+        for row in rows[: max(1, min(limit, 1000))]:
+            out.append(
+                {
+                    "doc_id": row.get("doc_id"),
+                    "title": row.get("title"),
+                    "source": row.get("source"),
+                    "updated_at_ms": row.get("updated_at_ms"),
+                    "metadata": row.get("metadata", {}),
+                }
+            )
+        return out
 
     def put_experience(self, exp_id: str, entry: Dict[str, Any]) -> None:
         row = dict(entry)
@@ -1047,14 +1133,86 @@ class ExecutionPolicy:
 
     def __init__(self):
         self._risk_by_permission = dict(TOOL_RISK_BY_PERMISSION)
+        self._trusted_domains = {
+            "raw.githubusercontent.com",
+            "github.com",
+            "api.github.com",
+            "localhost",
+            "127.0.0.1",
+        }
+        env_domains = os.getenv("TRUSTED_NETWORK_DOMAINS", "").strip()
+        if env_domains:
+            for item in env_domains.split(","):
+                dom = item.strip().lower()
+                if dom:
+                    self._trusted_domains.add(dom)
 
     def risk_level(self, permission: str) -> str:
         return self._risk_by_permission.get(permission, "medium")
+
+    def _host_is_private_or_local(self, host: str) -> bool:
+        host_l = (host or "").strip().lower()
+        if not host_l:
+            return True
+        if host_l in {"localhost", "127.0.0.1", "::1"}:
+            return True
+        try:
+            ip = ipaddress.ip_address(host_l)
+            return bool(ip.is_private or ip.is_loopback or ip.is_link_local)
+        except Exception:
+            return False
+
+    def _check_network_boundary(self, tool_name: str, args: Dict[str, Any]) -> Tuple[bool, str]:
+        url = str(args.get("url", "")).strip()
+        if not url:
+            return True, "no_url"
+        try:
+            parsed = urllib.parse.urlparse(url)
+        except Exception:
+            return False, f"invalid URL for `{tool_name}`."
+        scheme = (parsed.scheme or "").lower()
+        host = (parsed.hostname or "").lower()
+        if scheme not in {"http", "https"}:
+            return False, f"Blocked `{tool_name}`: only http/https URLs are allowed."
+        if scheme == "http" and host not in {"localhost", "127.0.0.1"}:
+            return False, f"Blocked `{tool_name}`: non-local HTTP is not allowed; use HTTPS."
+        if self._host_is_private_or_local(host) and host not in {"localhost", "127.0.0.1"}:
+            return False, f"Blocked `{tool_name}`: private network host is outside trust boundary."
+        if host and host not in self._trusted_domains:
+            approved = parse_bool(args.get("approved"), default=False)
+            if not approved:
+                return (
+                    False,
+                    f"Host `{host}` is outside trusted domains. Add `approved=true` to allow this network access.",
+                )
+        return True, "network_allowed"
+
+    def _check_filesystem_boundary(self, tool_name: str, args: Dict[str, Any]) -> Tuple[bool, str]:
+        db_path = str(args.get("db_path", "")).strip()
+        if not db_path:
+            return True, "no_db_path"
+        p = Path(db_path).expanduser()
+        if p.is_absolute():
+            # Allow local absolute paths but block dangerous system roots.
+            blocked_prefixes = ["/etc", "/bin", "/sbin", "/usr/bin", "/System", "/private/etc"]
+            if any(str(p).startswith(pref) for pref in blocked_prefixes):
+                return False, f"Blocked `{tool_name}`: database path is outside allowed trust boundary."
+        return True, "fs_allowed"
 
     def evaluate(self, tool_name: str, spec: ToolSpec, args: Dict[str, Any], task: str) -> Dict[str, Any]:
         risk = self.risk_level(spec.permission)
         approved = parse_bool(args.get("approved"), default=False)
         task_l = task.lower()
+
+        if spec.permission in {"network_read", "network_write"}:
+            ok, reason = self._check_network_boundary(tool_name=tool_name, args=args)
+            if not ok:
+                return {"allow": False, "risk": risk, "reason": reason}
+        if spec.permission in {"db_read", "db_write"}:
+            ok, reason = self._check_filesystem_boundary(tool_name=tool_name, args=args)
+            if not ok:
+                return {"allow": False, "risk": risk, "reason": reason}
+
         if not approved and risk == "high":
             approved = ("approve" in task_l and tool_name.lower() in task_l) or ("approved" in task_l)
 
@@ -1322,6 +1480,26 @@ class DynamicLoopOrchestrator:
         if not text:
             return None
         low = text.lower()
+        if (
+            ("logistic regression" in low or "logisticregression" in low)
+            and any(k in low for k in ["download", "dataset", "data", "train", "model"])
+        ):
+            return {
+                "mode": "EXECUTE",
+                "goal": "Prepare a dataset and run logistic regression with executable outputs.",
+                "success_criteria": ["Return dataset path, training metrics, and reproducible artifacts."],
+                "constraints": [],
+                "clarification_question": "",
+                "final_reply": "",
+                "plan": [
+                    {
+                        "step": "Prepare dataset and run logistic regression demo",
+                        "tool": "prepare_logistic_regression_demo",
+                        "arguments": {"task": task, "output_path": "data/logreg_dataset.csv"},
+                    }
+                ],
+            }
+
         token = self._extract_lookup_token(text)
         asks_lookup = any(k in low for k in ["find", "search", "locate", "lookup", "where", "contains", "key", "id"])
         mentions_json = "json" in low
@@ -1443,7 +1621,346 @@ class DynamicLoopOrchestrator:
             return None
         return None
 
+    def _json_schema_from_input_schema(self, schema: Dict[str, Any]) -> Dict[str, Any]:
+        properties: Dict[str, Any] = {}
+        required: List[str] = []
+        for key, raw_type in (schema or {}).items():
+            t = str(raw_type).lower()
+            prop: Dict[str, Any] = {"description": str(raw_type)}
+            if "int" in t:
+                prop["type"] = "integer"
+            elif "bool" in t:
+                prop["type"] = "boolean"
+            elif "list" in t:
+                prop["type"] = "array"
+                prop["items"] = {"type": "string"}
+            elif "dict" in t or "json" in t or "object" in t:
+                prop["type"] = "object"
+                prop["additionalProperties"] = True
+            else:
+                prop["type"] = "string"
+            if "null" in t:
+                prop = {"anyOf": [prop, {"type": "null"}]}
+            properties[str(key)] = prop
+            if "default" not in t and "null" not in t:
+                required.append(str(key))
+        return {
+            "type": "object",
+            "properties": properties,
+            "required": required,
+            "additionalProperties": True,
+        }
+
+    def _openai_tool_definitions(self) -> List[Dict[str, Any]]:
+        defs = []
+        for spec in self.tools.tools.values():
+            defs.append(
+                {
+                    "type": "function",
+                    "name": spec.name,
+                    "description": spec.description or spec.name,
+                    "parameters": self._json_schema_from_input_schema(spec.input_schema),
+                }
+            )
+        return defs
+
+    def _extract_response_tool_calls(self, response: Any) -> List[Dict[str, Any]]:
+        calls: List[Dict[str, Any]] = []
+        output = getattr(response, "output", None)
+        if not isinstance(output, list):
+            return calls
+        for item in output:
+            item_type = getattr(item, "type", None)
+            if item_type is None and isinstance(item, dict):
+                item_type = item.get("type")
+            if item_type not in {"function_call", "tool_call"}:
+                continue
+            name = getattr(item, "name", None)
+            if name is None and isinstance(item, dict):
+                name = item.get("name")
+            args = getattr(item, "arguments", None)
+            if args is None and isinstance(item, dict):
+                args = item.get("arguments", "{}")
+            call_id = getattr(item, "call_id", None)
+            if call_id is None and isinstance(item, dict):
+                call_id = item.get("call_id") or item.get("id")
+            if not isinstance(name, str) or not name.strip():
+                continue
+            if not isinstance(args, str):
+                try:
+                    args = json.dumps(args or {}, ensure_ascii=False)
+                except Exception:
+                    args = "{}"
+            calls.append(
+                {
+                    "name": name.strip(),
+                    "arguments": args,
+                    "call_id": str(call_id or f"call_{now_ms()}"),
+                }
+            )
+        return calls
+
+    def _run_model_tool_loop(
+        self,
+        task: str,
+        trace_id: str,
+        session_id: str,
+        recent_messages: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        if self.client is None:
+            return None
+
+        # Canonical agent loop:
+        # messages -> model -> tool_use? -> execute tools -> append tool_result -> loop
+        system_prompt = (
+            "You are the runtime controller in a tool-using agent loop. "
+            "Follow this pattern exactly: understand goal -> decide next action -> call tools if needed -> observe outputs -> continue or stop. "
+            "You decide when to call tools and when to finish. "
+            "When information is missing, ask one concise clarification question instead of guessing. "
+            "Do not fabricate tool outputs. Use only available tools."
+        )
+        recent_context = []
+        for row in recent_messages[-8:]:
+            if not isinstance(row, dict):
+                continue
+            role = str(row.get("role", "user")).strip().lower()
+            if role not in {"user", "assistant"}:
+                continue
+            text = str(row.get("content", "")).strip()
+            if not text:
+                continue
+            recent_context.append({"role": role, "content": truncate_text(text, max_chars=1000)})
+
+        user_payload = {
+            "task": task,
+            "workspace_root": str(self.workspace),
+            "recent_context": recent_context,
+            "instruction": (
+                "If tools are needed, call them. If not, answer directly. "
+                "If blocked by missing inputs, ask a focused question."
+            ),
+        }
+
+        tool_defs = self._openai_tool_definitions()
+        observations: List[Dict[str, Any]] = []
+        executed_tools: List[str] = []
+        loop_state: Dict[str, Any] = {
+            "task": task,
+            "goal": task,
+            "observations": observations,
+            "executed_tools": executed_tools,
+            "plan": [],
+        }
+        max_iters = 24
+        repeated_calls: Dict[str, int] = {}
+
+        self._record_event(trace_id, "tool_loop_start", {"task_preview": truncate_text(task, max_chars=220)})
+
+        try:
+            response = self.client.responses.create(
+                model=self.model,
+                input=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+                ],
+                tools=tool_defs,
+                temperature=0,
+            )
+        except Exception:
+            return None
+
+        for iteration in range(1, max_iters + 1):
+            calls = self._extract_response_tool_calls(response)
+            if not calls:
+                final_text = (getattr(response, "output_text", "") or "").strip()
+                if not final_text:
+                    final_text = self._compose_final_answer(loop_state)
+                normalized = final_text.lower()
+                looks_like_clarify = (
+                    "?" in final_text
+                    and any(
+                        marker in normalized
+                        for marker in [
+                            "please provide",
+                            "could you",
+                            "can you",
+                            "which",
+                            "what",
+                            "path",
+                            "file",
+                            "dataset",
+                        ]
+                    )
+                )
+                if looks_like_clarify and not executed_tools:
+                    self._record_event(
+                        trace_id,
+                        "finish",
+                        {"status": "clarification_needed", "iteration": iteration, "via": "model_text"},
+                    )
+                    out = {
+                        "intent": "GENERAL_CHAT",
+                        "reply": final_text,
+                        "suggestions": [],
+                        "planner_mode": "MODEL_CLARIFY",
+                        "goal": task,
+                        "trace_id": trace_id,
+                        "event_log_tail": self.memory.get_workflow_events(trace_id, limit=20),
+                    }
+                else:
+                    self._record_event(trace_id, "finish", {"status": "completed", "iteration": iteration, "via": "model_text"})
+                    out = {
+                        "intent": "DYNAMIC_EXECUTION",
+                        "status": "completed",
+                        "goal": task,
+                        "plan": [],
+                        "executed_tools": executed_tools,
+                        "observations": observations[-8:],
+                        "result_summary": final_text,
+                        "trace_id": trace_id,
+                        "event_log_tail": self.memory.get_workflow_events(trace_id, limit=20),
+                    }
+
+                exp = self._capture_experience(
+                    session_id=session_id,
+                    trace_id=trace_id,
+                    task=task,
+                    response=out,
+                    loop_state=loop_state,
+                )
+                if exp and out.get("intent") == "DYNAMIC_EXECUTION":
+                    out["experience_id"] = exp.get("experience_id")
+                    out["skill_candidate"] = exp.get("skill_candidate", {})
+                return out
+
+            outputs_for_model: List[Dict[str, Any]] = []
+            for call in calls:
+                tool_name = str(call.get("name", "")).strip()
+                args = ensure_dict(call.get("arguments", "{}"))
+                call_sig = f"{tool_name}:{json.dumps(args, ensure_ascii=False, sort_keys=True)}"
+                repeated_calls[call_sig] = repeated_calls.get(call_sig, 0) + 1
+
+                self._record_event(
+                    trace_id,
+                    "tool_call",
+                    {
+                        "iteration": iteration,
+                        "tool": tool_name,
+                        "arguments_preview": to_json_text(args, max_chars=350),
+                        "repeat_count": repeated_calls[call_sig],
+                    },
+                )
+
+                if repeated_calls[call_sig] > 3:
+                    result = {
+                        "ok": False,
+                        "error": "repeat_guard: same tool call repeated too many times; ask user for clarification.",
+                    }
+                    ok = False
+                    err = result["error"]
+                else:
+                    spec = self.tools.get_spec(tool_name)
+                    if spec is None:
+                        result = {"ok": False, "error": f"tool not found: {tool_name}"}
+                        ok = False
+                        err = result["error"]
+                    else:
+                        policy_result = self.policy.evaluate(tool_name=tool_name, spec=spec, args=args, task=task)
+                        if not policy_result.get("allow", False):
+                            result = {"ok": False, "error": policy_result.get("reason", "blocked by policy")}
+                            ok = False
+                            err = result["error"]
+                        else:
+                            try:
+                                result = self.tools.execute(tool_name, **args)
+                                ok = not (isinstance(result, dict) and result.get("ok") is False)
+                                err = result.get("error") if isinstance(result, dict) else None
+                            except Exception as e:
+                                result = {"ok": False, "error": str(e)}
+                                ok = False
+                                err = str(e)
+
+                executed_tools.append(tool_name)
+                compact = self._compact_tool_result(result)
+                obs = {
+                    "iteration": iteration,
+                    "step": f"tool_use:{tool_name}",
+                    "tool": tool_name,
+                    "arguments": args,
+                    "ok": ok,
+                    "error": err,
+                    "result": compact,
+                    "result_preview": to_json_text(compact, max_chars=900),
+                }
+                observations.append(obs)
+                self._record_event(
+                    trace_id,
+                    "observation",
+                    {
+                        "iteration": iteration,
+                        "tool": tool_name,
+                        "ok": ok,
+                        "error": err,
+                        "result_preview": to_json_text(compact, max_chars=350),
+                    },
+                )
+                outputs_for_model.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": str(call.get("call_id", f"call_{now_ms()}")),
+                        "output": json.dumps(result, ensure_ascii=False),
+                    }
+                )
+
+            try:
+                response = self.client.responses.create(
+                    model=self.model,
+                    previous_response_id=getattr(response, "id", None),
+                    input=outputs_for_model,
+                    tools=tool_defs,
+                    temperature=0,
+                )
+            except Exception as e:
+                observations.append(
+                    {
+                        "iteration": iteration,
+                        "step": "model_followup",
+                        "tool": "model",
+                        "arguments": {},
+                        "ok": False,
+                        "error": f"model follow-up failed: {e}",
+                        "result": {},
+                    }
+                )
+                break
+
+        self._record_event(trace_id, "finish", {"status": "max_iterations"})
+        fallback = {
+            "intent": "DYNAMIC_EXECUTION",
+            "status": "max_iterations_reached",
+            "goal": task,
+            "plan": [],
+            "executed_tools": executed_tools,
+            "observations": observations[-8:],
+            "result_summary": self._compose_final_answer(loop_state),
+            "trace_id": trace_id,
+            "event_log_tail": self.memory.get_workflow_events(trace_id, limit=20),
+        }
+        exp = self._capture_experience(
+            session_id=session_id,
+            trace_id=trace_id,
+            task=task,
+            response=fallback,
+            loop_state=loop_state,
+        )
+        if exp:
+            fallback["experience_id"] = exp.get("experience_id")
+            fallback["skill_candidate"] = exp.get("skill_candidate", {})
+        return fallback
+
     def _fallback_understand_goal(self, task: str) -> Dict[str, Any]:
+        task_text = (task or "").strip()
+        low = task_text.lower()
         explicit = parse_explicit_router_command(task)
         if explicit:
             intent = explicit.get("intent")
@@ -1570,6 +2087,21 @@ class DynamicLoopOrchestrator:
                 ],
             }
 
+        doc_candidates = _extract_path_candidates(task_text, extensions=["pdf", "docx", "txt", "md"])
+        if doc_candidates:
+            return {
+                "mode": "CHAT",
+                "goal": "Request corrected document path.",
+                "success_criteria": [],
+                "constraints": [],
+                "clarification_question": "",
+                "final_reply": (
+                    f"I found a document path-like input (`{doc_candidates[0]}`), but it is not accessible in the current workspace. "
+                    "Please confirm the exact readable path."
+                ),
+                "plan": [],
+            }
+
         inferred_spreadsheet_path = resolve_spreadsheet_path_from_text(task, workspace=str(self.workspace))
         if inferred_spreadsheet_path:
             return {
@@ -1588,6 +2120,21 @@ class DynamicLoopOrchestrator:
                 ],
             }
 
+        sheet_candidates = _extract_path_candidates(task_text, extensions=["csv", "xlsx"])
+        if sheet_candidates:
+            return {
+                "mode": "CHAT",
+                "goal": "Request corrected tabular file path.",
+                "success_criteria": [],
+                "constraints": [],
+                "clarification_question": "",
+                "final_reply": (
+                    f"I found a tabular path-like input (`{sheet_candidates[0]}`), but that file is not accessible right now. "
+                    "Please confirm the path or place the file under the workspace."
+                ),
+                "plan": [],
+            }
+
         inferred_code_path = resolve_code_path_from_text(task, workspace=str(self.workspace))
         if inferred_code_path:
             return {
@@ -1600,6 +2147,106 @@ class DynamicLoopOrchestrator:
                 "plan": [
                     {"step": "Read code file", "tool": "read_code_file", "arguments": {"path": inferred_code_path}},
                 ],
+            }
+
+        if ("walk through" in low or "walkthrough" in low or "list files" in low) and "workspace" in low:
+            return {
+                "mode": "EXECUTE",
+                "goal": "Inspect workspace structure and present an overview.",
+                "success_criteria": ["Return a concise list of files/directories to orient the user."],
+                "constraints": [],
+                "clarification_question": "",
+                "final_reply": "",
+                "plan": [
+                    {
+                        "step": "List workspace files recursively",
+                        "tool": "list_workspace_files",
+                        "arguments": {"pattern": "*", "recursive": True, "limit": 200},
+                    }
+                ],
+            }
+
+        if "what models" in low and ("provide" in low or "available" in low):
+            return {
+                "mode": "CHAT",
+                "goal": "Explain currently available modeling capabilities.",
+                "success_criteria": [],
+                "constraints": [],
+                "clarification_question": "",
+                "final_reply": (
+                    "Current built-in workflow supports tabular ML tasks: data prep, model suggestion, tuning, training, evaluation, and reporting. "
+                    "Typical model candidates include Logistic Regression, Random Forest, and XGBoost-style baselines depending on available tooling."
+                ),
+                "plan": [],
+            }
+
+        if "object detection" in low:
+            return {
+                "mode": "CHAT",
+                "goal": "Set accurate expectation for computer-vision capability.",
+                "success_criteria": [],
+                "constraints": [],
+                "clarification_question": "",
+                "final_reply": (
+                    "Object detection is not a built-in executable pipeline here. "
+                    "I can still scaffold code and a training/evaluation plan (for example with YOLO/Faster R-CNN) if you provide dataset format and runtime constraints."
+                ),
+                "plan": [],
+            }
+
+        if ("preprocess" in low or "data preprocessing" in low) and "?" in task_text:
+            return {
+                "mode": "CHAT",
+                "goal": "Collect minimum inputs to run data preprocessing.",
+                "success_criteria": [],
+                "constraints": [],
+                "clarification_question": "",
+                "final_reply": (
+                    "Yes. Share the dataset path, data format (CSV/XLSX/JSON), and target outcome, and I will run preprocessing plus a quick quality profile."
+                ),
+                "plan": [],
+            }
+
+        if "tool" not in low and any(token in low for token in ["word file", "docx", "pdf", "document"]) and any(
+            token in low for token in ["summar", "summary", "read", "analy", "walk through"]
+        ):
+            return {
+                "mode": "CHAT",
+                "goal": "Collect readable document path before summarization.",
+                "success_criteria": [],
+                "constraints": [],
+                "clarification_question": "",
+                "final_reply": (
+                    "Yes. Share the readable document path (.docx/.pdf/.txt/.md), and I will summarize it with key points and highlights."
+                ),
+                "plan": [],
+            }
+
+        if "tool" in low and ("pdf" in low or "word" in low or "docx" in low):
+            return {
+                "mode": "CHAT",
+                "goal": "Explain document-reading tools.",
+                "success_criteria": [],
+                "constraints": [],
+                "clarification_question": "",
+                "final_reply": (
+                    "For document reading, the core path is `read_document_file` (DOCX/PDF/TXT/MD) followed by `summarize_text`. "
+                    "If you send a readable file path, I can run the flow directly."
+                ),
+                "plan": [],
+            }
+
+        if low in {"hi", "hello", "hey"}:
+            return {
+                "mode": "CHAT",
+                "goal": "Acknowledge greeting and prompt for a concrete task.",
+                "success_criteria": [],
+                "constraints": [],
+                "clarification_question": "",
+                "final_reply": (
+                    "Ready. Tell me the concrete task and expected output, and include a file path if you want tool execution."
+                ),
+                "plan": [],
             }
 
         return {
@@ -2144,6 +2791,15 @@ class DynamicLoopOrchestrator:
         recent_messages: List[Dict[str, Any]],
         session_id: str = "default",
     ) -> Dict[str, Any]:
+        model_loop_result = self._run_model_tool_loop(
+            task=task,
+            trace_id=trace_id,
+            session_id=session_id,
+            recent_messages=recent_messages,
+        )
+        if model_loop_result is not None:
+            return model_loop_result
+
         understanding = self.understand_goal(task, recent_messages)
         start_event = self._record_event(
             trace_id,
@@ -3359,6 +4015,409 @@ def build_tool_registry(memory: MemoryStore, workspace: str) -> ToolRegistry:
                 rows.append({"raw": line})
         return {"count": len(rows), "matches": rows}
 
+    def network_http_request(
+        url: str,
+        method: str = "GET",
+        headers: Optional[Dict[str, Any]] = None,
+        body: Optional[str] = None,
+        json_body: Optional[Dict[str, Any]] = None,
+        timeout_s: int = 20,
+        approved: bool = False,
+    ) -> Dict[str, Any]:
+        if not url or not str(url).strip():
+            return {"ok": False, "error": "url is required"}
+        method_u = str(method or "GET").upper().strip()
+        if method_u not in {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}:
+            return {"ok": False, "error": f"unsupported method: {method_u}"}
+
+        req_headers: Dict[str, str] = {}
+        if isinstance(headers, dict):
+            for k, v in headers.items():
+                req_headers[str(k)] = str(v)
+
+        data_bytes: Optional[bytes] = None
+        if isinstance(json_body, dict):
+            payload = json.dumps(json_body, ensure_ascii=False).encode("utf-8")
+            data_bytes = payload
+            req_headers.setdefault("Content-Type", "application/json")
+        elif isinstance(body, str):
+            data_bytes = body.encode("utf-8")
+
+        req = urllib.request.Request(url=str(url).strip(), method=method_u, data=data_bytes, headers=req_headers)
+        try:
+            with urllib.request.urlopen(req, timeout=max(2, min(int(timeout_s or 20), 120))) as resp:
+                raw = resp.read(2_000_000)
+                content_type = str(resp.headers.get("Content-Type", ""))
+                text = raw.decode("utf-8", errors="ignore")
+                out_headers = {}
+                for key in ["Content-Type", "Content-Length", "Date", "Server"]:
+                    val = resp.headers.get(key)
+                    if val is not None:
+                        out_headers[key] = str(val)
+                return {
+                    "ok": True,
+                    "url": str(url).strip(),
+                    "method": method_u,
+                    "status_code": int(getattr(resp, "status", 200)),
+                    "content_type": content_type,
+                    "headers": out_headers,
+                    "body_text": truncate_text(text, max_chars=12000),
+                    "body_chars": len(text),
+                    "approved": bool(approved),
+                }
+        except urllib.error.HTTPError as e:
+            body_text = ""
+            try:
+                body_text = e.read().decode("utf-8", errors="ignore")
+            except Exception:
+                body_text = ""
+            return {
+                "ok": False,
+                "url": str(url).strip(),
+                "method": method_u,
+                "status_code": int(e.code),
+                "error": f"http error: {e}",
+                "body_text": truncate_text(body_text, max_chars=6000),
+                "approved": bool(approved),
+            }
+        except Exception as e:
+            return {"ok": False, "url": str(url).strip(), "method": method_u, "error": f"request failed: {e}", "approved": bool(approved)}
+
+    def network_download_file(
+        url: str,
+        output_path: str,
+        timeout_s: int = 40,
+        overwrite: bool = True,
+        approved: bool = False,
+    ) -> Dict[str, Any]:
+        if not url or not str(url).strip():
+            return {"ok": False, "error": "url is required"}
+        if not output_path or not str(output_path).strip():
+            return {"ok": False, "error": "output_path is required"}
+        out = resolve_workspace_file(output_path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        if out.exists() and not overwrite:
+            return {"ok": False, "error": f"output file exists: {out}"}
+
+        req = urllib.request.Request(url=str(url).strip(), method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=max(2, min(int(timeout_s or 40), 180))) as resp:
+                data = resp.read(25_000_000)
+                out.write_bytes(data)
+                return {
+                    "ok": True,
+                    "url": str(url).strip(),
+                    "output_path": str(out),
+                    "bytes": len(data),
+                    "status_code": int(getattr(resp, "status", 200)),
+                    "approved": bool(approved),
+                }
+        except Exception as e:
+            return {"ok": False, "url": str(url).strip(), "output_path": str(out), "error": f"download failed: {e}", "approved": bool(approved)}
+
+    def _parse_sql_params(params: Any) -> Tuple[Any, Optional[str]]:
+        if params is None:
+            return (), None
+        if isinstance(params, (list, tuple)):
+            return tuple(params), None
+        if isinstance(params, dict):
+            return dict(params), None
+        if isinstance(params, str):
+            text = params.strip()
+            if not text:
+                return (), None
+            try:
+                parsed = json.loads(text)
+            except Exception as e:
+                return (), f"failed to parse params json: {e}"
+            if isinstance(parsed, list):
+                return tuple(parsed), None
+            if isinstance(parsed, dict):
+                return dict(parsed), None
+            return (), "params json must be list or dict"
+        return (), "unsupported params type"
+
+    def sqlite_query(
+        db_path: str,
+        query: str,
+        params: Any = None,
+        limit: int = 200,
+        approved: bool = False,
+    ) -> Dict[str, Any]:
+        import sqlite3
+
+        if not db_path:
+            return {"ok": False, "error": "db_path is required"}
+        if not query or not str(query).strip():
+            return {"ok": False, "error": "query is required"}
+        query_text = str(query).strip()
+        if not query_text.lower().startswith("select"):
+            return {"ok": False, "error": "sqlite_query only supports SELECT statements"}
+
+        p = Path(db_path).expanduser()
+        if not p.is_absolute():
+            p = workspace_path / p
+        p = p.resolve()
+        if not p.exists() or not p.is_file():
+            return {"ok": False, "error": f"db file not found: {p}"}
+        sql_params, err = _parse_sql_params(params)
+        if err:
+            return {"ok": False, "error": err}
+        q = query_text.rstrip(" ;")
+        q = f"{q} LIMIT {max(1, min(int(limit or 200), 5000))}"
+        try:
+            conn = sqlite3.connect(str(p))
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute(q, sql_params)
+            rows = cur.fetchall()
+            columns = [str(x[0]) for x in (cur.description or [])]
+            data_rows = []
+            for row in rows:
+                item = {}
+                for col in columns:
+                    val = row[col]
+                    if isinstance(val, (bytes, bytearray)):
+                        item[col] = f"<bytes:{len(val)}>"
+                    else:
+                        item[col] = val
+                data_rows.append(item)
+            conn.close()
+            return {
+                "ok": True,
+                "db_path": str(p),
+                "query": q,
+                "row_count": len(data_rows),
+                "columns": columns,
+                "rows": data_rows,
+                "approved": bool(approved),
+            }
+        except Exception as e:
+            return {"ok": False, "db_path": str(p), "error": f"sqlite query failed: {e}", "approved": bool(approved)}
+
+    def sqlite_execute(
+        db_path: str,
+        statement: str,
+        params: Any = None,
+        approved: bool = False,
+    ) -> Dict[str, Any]:
+        import sqlite3
+
+        if not db_path:
+            return {"ok": False, "error": "db_path is required"}
+        if not statement or not str(statement).strip():
+            return {"ok": False, "error": "statement is required"}
+        stmt = str(statement).strip()
+        if stmt.lower().startswith("select"):
+            return {"ok": False, "error": "use sqlite_query for SELECT statements"}
+
+        p = Path(db_path).expanduser()
+        if not p.is_absolute():
+            p = workspace_path / p
+        p = p.resolve()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        sql_params, err = _parse_sql_params(params)
+        if err:
+            return {"ok": False, "error": err}
+        try:
+            conn = sqlite3.connect(str(p))
+            cur = conn.cursor()
+            cur.execute(stmt, sql_params)
+            conn.commit()
+            rowcount = int(cur.rowcount if cur.rowcount is not None else -1)
+            lastrowid = int(cur.lastrowid if cur.lastrowid is not None else 0)
+            conn.close()
+            return {
+                "ok": True,
+                "db_path": str(p),
+                "statement": stmt,
+                "rowcount": rowcount,
+                "lastrowid": lastrowid,
+                "approved": bool(approved),
+            }
+        except Exception as e:
+            return {"ok": False, "db_path": str(p), "error": f"sqlite execute failed: {e}", "approved": bool(approved)}
+
+    browser_state: Dict[str, Any] = {
+        "url": "",
+        "title": "",
+        "html_preview": "",
+        "text_preview": "",
+        "links": [],
+        "updated_at_ms": 0,
+    }
+
+    def _extract_links_from_html(html: str, base_url: str) -> List[Dict[str, str]]:
+        links: List[Dict[str, str]] = []
+        for m in re.finditer(r"<a[^>]+href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>", html, flags=re.IGNORECASE | re.DOTALL):
+            href = (m.group(1) or "").strip()
+            txt = re.sub(r"<[^>]+>", " ", m.group(2) or "")
+            txt = re.sub(r"\s+", " ", txt).strip()
+            if not href:
+                continue
+            abs_url = urllib.parse.urljoin(base_url, href)
+            links.append({"text": txt[:160], "href": abs_url})
+            if len(links) >= 80:
+                break
+        return links
+
+    def browser_open_page(url: str, timeout_s: int = 20, approved: bool = False) -> Dict[str, Any]:
+        row = network_http_request(
+            url=url,
+            method="GET",
+            headers={"User-Agent": "multiagents-browser/1.0"},
+            timeout_s=timeout_s,
+            approved=approved,
+        )
+        if not row.get("ok"):
+            return row
+        html = str(row.get("body_text", ""))
+        title_match = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL)
+        title = re.sub(r"\s+", " ", title_match.group(1)).strip() if title_match else ""
+        text = re.sub(r"<script.*?</script>|<style.*?</style>", " ", html, flags=re.IGNORECASE | re.DOTALL)
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        links = _extract_links_from_html(html, base_url=str(row.get("url", url)))
+        browser_state.update(
+            {
+                "url": str(row.get("url", url)),
+                "title": title,
+                "html_preview": truncate_text(html, max_chars=7000),
+                "text_preview": truncate_text(text, max_chars=3500),
+                "links": links[:40],
+                "updated_at_ms": now_ms(),
+            }
+        )
+        return {
+            "ok": True,
+            "url": browser_state["url"],
+            "title": browser_state["title"],
+            "text_preview": browser_state["text_preview"],
+            "links": browser_state["links"][:20],
+            "link_count": len(browser_state["links"]),
+            "approved": bool(approved),
+        }
+
+    def browser_click_link(link_text: str = "", link_index: int = 1, approved: bool = False) -> Dict[str, Any]:
+        links = browser_state.get("links", [])
+        if not isinstance(links, list) or not links:
+            return {"ok": False, "error": "browser state has no links; run browser_open_page first"}
+        picked = None
+        if isinstance(link_text, str) and link_text.strip():
+            q = link_text.strip().lower()
+            for link in links:
+                txt = str(link.get("text", "")).lower()
+                href = str(link.get("href", "")).lower()
+                if q in txt or q in href:
+                    picked = link
+                    break
+        if picked is None:
+            idx = max(1, int(link_index or 1))
+            idx = min(idx, len(links))
+            picked = links[idx - 1]
+        href = str(picked.get("href", "")).strip()
+        if not href:
+            return {"ok": False, "error": "selected link has empty href"}
+        row = browser_open_page(url=href, timeout_s=20, approved=approved)
+        if not row.get("ok"):
+            return row
+        row["clicked_link"] = picked
+        return row
+
+    def browser_get_state() -> Dict[str, Any]:
+        return {
+            "ok": True,
+            "state": {
+                "url": browser_state.get("url", ""),
+                "title": browser_state.get("title", ""),
+                "text_preview": browser_state.get("text_preview", ""),
+                "links": browser_state.get("links", [])[:20],
+                "updated_at_ms": browser_state.get("updated_at_ms", 0),
+            },
+        }
+
+    def browser_find_text(pattern: str, max_matches: int = 20) -> Dict[str, Any]:
+        if not pattern or not str(pattern).strip():
+            return {"ok": False, "error": "pattern is required"}
+        text = str(browser_state.get("text_preview", ""))
+        if not text:
+            return {"ok": False, "error": "browser state is empty; run browser_open_page first"}
+        q = str(pattern).strip().lower()
+        matches = []
+        low = text.lower()
+        start = 0
+        while len(matches) < max(1, min(int(max_matches or 20), 200)):
+            idx = low.find(q, start)
+            if idx < 0:
+                break
+            left = max(0, idx - 80)
+            right = min(len(text), idx + len(q) + 80)
+            matches.append({"offset": idx, "snippet": text[left:right]})
+            start = idx + len(q)
+        return {"ok": True, "pattern": pattern, "count": len(matches), "matches": matches}
+
+    def observe_browser_state() -> Dict[str, Any]:
+        return browser_get_state()
+
+    def observe_git_diff(pathspec: str = "", max_chars: int = 20000) -> Dict[str, Any]:
+        cmd = ["git", "-C", str(workspace_path), "diff"]
+        if isinstance(pathspec, str) and pathspec.strip():
+            cmd.extend(["--", pathspec.strip()])
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            if proc.returncode != 0:
+                return {"ok": False, "error": proc.stderr.strip() or proc.stdout.strip(), "command": " ".join(cmd)}
+            names = subprocess.run(
+                ["git", "-C", str(workspace_path), "diff", "--name-only"],
+                capture_output=True,
+                text=True,
+            )
+            files = [ln.strip() for ln in (names.stdout or "").splitlines() if ln.strip()]
+            return {
+                "ok": True,
+                "pathspec": pathspec,
+                "changed_files": files,
+                "diff_text": truncate_text(proc.stdout or "", max_chars=max(1000, min(max_chars, 120000))),
+            }
+        except Exception as e:
+            return {"ok": False, "error": f"git diff observation failed: {e}"}
+
+    def observe_error_logs(pattern: str = "error|exception|traceback", top_k: int = 80) -> Dict[str, Any]:
+        try:
+            proc = subprocess.run(
+                ["rg", "-n", "--no-heading", "-i", "-g", "*.log", pattern, str(workspace_path)],
+                capture_output=True,
+                text=True,
+            )
+            lines = [ln.strip() for ln in (proc.stdout or "").splitlines() if ln.strip()]
+            rows = []
+            for line in lines[: max(1, min(int(top_k or 80), 500))]:
+                parts = line.split(":", 2)
+                if len(parts) == 3:
+                    rows.append({"path": parts[0], "line": parts[1], "text": parts[2]})
+                else:
+                    rows.append({"raw": line})
+            return {"ok": True, "pattern": pattern, "count": len(rows), "matches": rows}
+        except Exception as e:
+            return {"ok": False, "error": f"log observation failed: {e}", "pattern": pattern}
+
+    def observe_recent_events(trace_id: str = "", limit: int = 30) -> Dict[str, Any]:
+        if isinstance(trace_id, str) and trace_id.strip():
+            rows = memory.get_workflow_events(trace_id.strip(), limit=max(1, min(int(limit or 30), 200)))
+            return {"ok": True, "trace_id": trace_id.strip(), "events": rows}
+        events = []
+        workflow_rows = memory._data.get("workflow", {})
+        for key, value in workflow_rows.items():
+            if not isinstance(key, str) or not key.startswith("events::"):
+                continue
+            tr = key.split("events::", 1)[-1]
+            if isinstance(value, dict):
+                evs = value.get("events", [])
+                if isinstance(evs, list) and evs:
+                    events.append({"trace_id": tr, "latest_event": evs[-1], "event_count": len(evs)})
+        events.sort(key=lambda x: x.get("latest_event", {}).get("ts_ms", 0), reverse=True)
+        return {"ok": True, "traces": events[: max(1, min(int(limit or 30), 200))]}
+
     def read_text_file(path: str, max_chars: int = 20000) -> Dict[str, Any]:
         if not path:
             return {"ok": False, "error": "path is required"}
@@ -3382,6 +4441,83 @@ def build_tool_registry(memory: MemoryStore, workspace: str) -> ToolRegistry:
         except Exception as e:
             return {"ok": False, "error": f"failed to parse json: {e}", "path": row.get("path")}
         return {"ok": True, "path": row.get("path"), "json": parsed}
+
+    def knowledge_add_reference(
+        path: str,
+        title: Optional[str] = None,
+        category: str = "reference",
+        tags: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        if not path or not str(path).strip():
+            return {"ok": False, "error": "path is required"}
+        p = resolve_workspace_file(path)
+        if not p.exists() or not p.is_file():
+            return {"ok": False, "error": f"file not found: {p}"}
+        suffix = p.suffix.lower()
+        text = ""
+        if suffix in {".md", ".txt", ".py", ".json", ".yaml", ".yml", ".toml", ".ini", ".csv", ".sql"}:
+            row = read_text_file(path=str(p), max_chars=400000)
+            if not row.get("ok"):
+                return row
+            text = str(row.get("text", ""))
+        elif suffix in {".pdf", ".docx"}:
+            row = read_document_file(path=str(p))
+            if not row.get("ok"):
+                return row
+            text = str(row.get("text", ""))
+        else:
+            return {"ok": False, "error": f"unsupported reference file type: {suffix}"}
+        doc_id = f"doc_ref_{now_ms()}"
+        safe_tags = []
+        if isinstance(tags, list):
+            safe_tags = [str(x).strip() for x in tags if str(x).strip()][:20]
+        metadata = {"category": str(category or "reference").strip() or "reference", "tags": safe_tags}
+        memory.put_knowledge_doc(
+            doc_id=doc_id,
+            title=title or p.name,
+            text=text,
+            source=str(p),
+            metadata=metadata,
+        )
+        return {"ok": True, "doc_id": doc_id, "source": str(p), "chars": len(text), "metadata": metadata}
+
+    def knowledge_ingest_workspace_docs(
+        pattern: str = "*.md",
+        recursive: bool = True,
+        limit: int = 200,
+        category: str = "reference",
+    ) -> Dict[str, Any]:
+        files = list_workspace_files(pattern=pattern, recursive=recursive, limit=limit).get("files", [])
+        if not isinstance(files, list):
+            return {"ok": False, "error": "failed to list files"}
+        ingested = []
+        errors = []
+        for file_path in files[: max(1, min(int(limit or 200), 1000))]:
+            row = knowledge_add_reference(path=str(file_path), title=None, category=category, tags=[])
+            if row.get("ok"):
+                ingested.append({"doc_id": row.get("doc_id"), "source": row.get("source"), "chars": row.get("chars", 0)})
+            else:
+                errors.append({"source": str(file_path), "error": row.get("error", "ingest failed")})
+        return {"ok": True, "count": len(ingested), "ingested": ingested[:200], "errors": errors[:50]}
+
+    def knowledge_list_sources(limit: int = 100) -> Dict[str, Any]:
+        return {"ok": True, "sources": memory.list_knowledge_sources(limit=max(1, min(int(limit or 100), 1000)))}
+
+    def knowledge_get_doc(doc_id: str, max_chars: int = 30000) -> Dict[str, Any]:
+        if not doc_id or not str(doc_id).strip():
+            return {"ok": False, "error": "doc_id is required"}
+        row = memory.get_knowledge_doc(str(doc_id).strip())
+        if not row:
+            return {"ok": False, "error": f"doc not found: {doc_id}"}
+        text = str(row.get("text", ""))
+        return {
+            "ok": True,
+            "doc_id": row.get("doc_id"),
+            "title": row.get("title"),
+            "source": row.get("source"),
+            "metadata": row.get("metadata", {}),
+            "text": truncate_text(text, max_chars=max(1000, min(int(max_chars or 30000), 400000))),
+        }
 
     def read_csv_preview(path: str, max_rows: int = 20) -> Dict[str, Any]:
         if not path:
@@ -3916,6 +5052,242 @@ if __name__ == "__main__":
             parsed["error"] = f"python analyzer exited with code {proc.returncode}"
         return parsed
 
+    def prepare_logistic_regression_demo(
+        task: str,
+        output_path: str = "data/logreg_dataset.csv",
+        max_rows: int = 5000,
+    ) -> Dict[str, Any]:
+        """
+        Robust end-to-end demo:
+        1) Try downloading a public binary-classification dataset
+        2) If download fails, generate synthetic binary data
+        3) Train logistic regression with pure numpy
+        4) Save dataset + training report
+        """
+
+        import numpy as np
+        import warnings
+
+        def sigmoid(x: Any) -> Any:
+            arr = np.array(x, dtype=np.float64)
+            arr = np.clip(arr, -50.0, 50.0)
+            return 1.0 / (1.0 + np.exp(-arr))
+
+        def compute_metrics(y_true: Any, y_pred: Any) -> Dict[str, Any]:
+            y_t = np.array(y_true, dtype=np.int64)
+            y_p = np.array(y_pred, dtype=np.int64)
+            tp = int(np.sum((y_t == 1) & (y_p == 1)))
+            fp = int(np.sum((y_t == 0) & (y_p == 1)))
+            tn = int(np.sum((y_t == 0) & (y_p == 0)))
+            fn = int(np.sum((y_t == 1) & (y_p == 0)))
+            accuracy = float((tp + tn) / max(1, len(y_t)))
+            precision = float(tp / max(1, tp + fp))
+            recall = float(tp / max(1, tp + fn))
+            f1 = float(2 * precision * recall / max(1e-12, precision + recall))
+            return {
+                "accuracy": round(accuracy, 4),
+                "precision": round(precision, 4),
+                "recall": round(recall, 4),
+                "f1": round(f1, 4),
+                "confusion_matrix": {"tp": tp, "fp": fp, "tn": tn, "fn": fn},
+            }
+
+        def train_logreg_numpy(x: Any, y: Any, lr: float = 0.1, epochs: int = 1200) -> Dict[str, Any]:
+            x_arr = np.nan_to_num(np.array(x, dtype=np.float64), nan=0.0, posinf=50.0, neginf=-50.0)
+            y_arr = np.array(y, dtype=np.float64).reshape(-1, 1)
+            n, d = x_arr.shape
+            mean = x_arr.mean(axis=0, keepdims=True)
+            std = x_arr.std(axis=0, keepdims=True)
+            std[std < 1e-9] = 1.0
+            x_norm = (x_arr - mean) / std
+            x_bias = np.concatenate([np.ones((n, 1), dtype=np.float64), x_norm], axis=1)
+            w = np.zeros((d + 1, 1), dtype=np.float64)
+            losses: List[float] = []
+
+            for _ in range(epochs):
+                with np.errstate(all="ignore"):
+                    probs = sigmoid(x_bias @ w)
+                    grad = (x_bias.T @ (probs - y_arr)) / n
+                w = w - lr * grad
+                w = np.nan_to_num(w, nan=0.0, posinf=50.0, neginf=-50.0)
+                loss = -np.mean(y_arr * np.log(probs + 1e-12) + (1 - y_arr) * np.log(1 - probs + 1e-12))
+                if not np.isfinite(loss):
+                    loss = float("nan")
+                losses.append(float(loss))
+
+            clean_losses = [x for x in losses if isinstance(x, float) and math.isfinite(x)]
+            return {
+                "weights": w.reshape(-1).tolist(),
+                "mean": mean.reshape(-1).tolist(),
+                "std": std.reshape(-1).tolist(),
+                "final_loss": round(float(clean_losses[-1]), 6) if clean_losses else None,
+                "loss_head": [round(float(x), 6) for x in clean_losses[:5]],
+                "loss_tail": [round(float(x), 6) for x in clean_losses[-5:]],
+            }
+
+        def predict_with_model(model: Dict[str, Any], x: Any) -> Any:
+            import numpy as np
+
+            x_arr = np.nan_to_num(np.array(x, dtype=np.float64), nan=0.0, posinf=50.0, neginf=-50.0)
+            mean = np.array(model["mean"], dtype=np.float64).reshape(1, -1)
+            std = np.array(model["std"], dtype=np.float64).reshape(1, -1)
+            std[std < 1e-9] = 1.0
+            x_norm = (x_arr - mean) / std
+            x_bias = np.concatenate([np.ones((x_norm.shape[0], 1), dtype=np.float64), x_norm], axis=1)
+            w = np.array(model["weights"], dtype=np.float64).reshape(-1, 1)
+            with np.errstate(all="ignore"):
+                probs = sigmoid(x_bias @ w).reshape(-1)
+            preds = (probs >= 0.5).astype(np.int64)
+            return probs.tolist(), preds.tolist()
+
+        def try_download_binary_dataset(max_samples: int) -> Tuple[Optional[List[str]], Optional[List[List[float]]], Optional[List[int]], str]:
+            # Pima Indians Diabetes dataset (last column is binary target)
+            url = "https://raw.githubusercontent.com/jbrownlee/Datasets/master/pima-indians-diabetes.data.csv"
+            try:
+                with urllib.request.urlopen(url, timeout=12) as resp:
+                    raw = resp.read().decode("utf-8", errors="ignore")
+            except Exception as e:
+                return None, None, None, f"download_failed: {e}"
+
+            lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+            if not lines:
+                return None, None, None, "download_failed: empty dataset"
+
+            features: List[List[float]] = []
+            labels: List[int] = []
+            for ln in lines[: max(50, min(max_samples, 20000))]:
+                parts = [p.strip() for p in ln.split(",")]
+                if len(parts) < 2:
+                    continue
+                try:
+                    vals = [float(x) for x in parts]
+                except Exception:
+                    continue
+                x = vals[:-1]
+                y = int(round(vals[-1]))
+                if y not in {0, 1}:
+                    continue
+                features.append(x)
+                labels.append(y)
+
+            if len(features) < 50:
+                return None, None, None, "download_failed: insufficient valid rows"
+            headers = [f"x{i+1}" for i in range(len(features[0]))]
+            return headers, features, labels, "downloaded"
+
+        def generate_synthetic_binary_dataset(max_samples: int) -> Tuple[List[str], List[List[float]], List[int], str]:
+            import numpy as np
+
+            n = max(500, min(max_samples, 5000))
+            d = 8
+            rng = np.random.default_rng(42)
+            x = rng.normal(0.0, 1.0, size=(n, d))
+            w_true = rng.normal(0.0, 1.0, size=(d,))
+            noise = rng.normal(0.0, 0.5, size=(n,))
+            with np.errstate(all="ignore"):
+                logits = x @ w_true + noise
+            logits = np.nan_to_num(logits, nan=0.0, posinf=50.0, neginf=-50.0)
+            probs = sigmoid(logits)
+            y = (probs >= 0.5).astype(np.int64)
+            headers = [f"x{i+1}" for i in range(d)]
+            return headers, x.tolist(), y.tolist(), "generated"
+
+        output = resolve_workspace_file(output_path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        report_path = output.with_suffix(".report.md")
+
+        headers = None
+        x_rows = None
+        y_rows = None
+        source = "generated"
+        source_note = ""
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            headers, x_rows, y_rows, source = try_download_binary_dataset(max_rows)
+            if headers is None or x_rows is None or y_rows is None:
+                source_note = source
+                headers, x_rows, y_rows, source = generate_synthetic_binary_dataset(max_rows)
+
+        n = len(x_rows)
+        if n < 50:
+            return {"ok": False, "error": "failed to prepare enough rows for logistic regression"}
+
+        split_idx = max(1, int(n * 0.8))
+        x_train = x_rows[:split_idx]
+        y_train = y_rows[:split_idx]
+        x_test = x_rows[split_idx:]
+        y_test = y_rows[split_idx:]
+        if len(x_test) < 20:
+            x_train = x_rows[:-20]
+            y_train = y_rows[:-20]
+            x_test = x_rows[-20:]
+            y_test = y_rows[-20:]
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            model = train_logreg_numpy(x_train, y_train, lr=0.08, epochs=1000)
+            probs, preds = predict_with_model(model, x_test)
+        metrics = compute_metrics(y_test, preds)
+
+        with output.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(headers + ["label"])
+            for x_row, y_val in zip(x_rows, y_rows):
+                writer.writerow([*x_row, int(y_val)])
+
+        report_lines = [
+            "# Logistic Regression Demo Report",
+            "",
+            f"- Task: {task}",
+            f"- Dataset source: {source}",
+            f"- Dataset path: {output}",
+            f"- Rows: {len(x_rows)}",
+            f"- Features: {len(headers)}",
+            f"- Train rows: {len(x_train)}",
+            f"- Test rows: {len(x_test)}",
+            "",
+            "## Metrics",
+            f"- Accuracy: {metrics['accuracy']}",
+            f"- Precision: {metrics['precision']}",
+            f"- Recall: {metrics['recall']}",
+            f"- F1: {metrics['f1']}",
+            "",
+            "## Training",
+            f"- Final loss: {model.get('final_loss')}",
+            f"- Loss head: {model.get('loss_head')}",
+            f"- Loss tail: {model.get('loss_tail')}",
+            "",
+        ]
+        if source_note:
+            report_lines.append("## Notes")
+            report_lines.append(f"- Download fallback reason: {source_note}")
+            report_lines.append("")
+        report_path.write_text("\n".join(report_lines), encoding="utf-8")
+
+        preview_rows: List[Dict[str, Any]] = []
+        for i, x_row in enumerate(x_rows[:5]):
+            item = {headers[j]: round(float(x_row[j]), 6) for j in range(len(headers))}
+            item["label"] = int(y_rows[i])
+            preview_rows.append(item)
+
+        return {
+            "ok": True,
+            "summary": (
+                f"Prepared dataset ({source}) and trained logistic regression. "
+                f"F1={metrics['f1']}, accuracy={metrics['accuracy']}. "
+                f"Dataset saved to {output}."
+            ),
+            "dataset_source": source,
+            "dataset_path": str(output),
+            "report_path": str(report_path),
+            "rows": len(x_rows),
+            "feature_count": len(headers),
+            "metrics": metrics,
+            "train_rows": len(x_train),
+            "test_rows": len(x_test),
+            "sample_rows": preview_rows,
+        }
+
     def write_text_file(path: str, text: str, overwrite: bool = True) -> Dict[str, Any]:
         if not path:
             return {"ok": False, "error": "path is required"}
@@ -4333,6 +5705,138 @@ if __name__ == "__main__":
     )
     tools.register(
         ToolSpec(
+            name="network_http_request",
+            func=network_http_request,
+            description="Send HTTP request and return status/headers/body preview.",
+            input_schema={
+                "url": "string",
+                "method": "GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS",
+                "headers": "dict|null",
+                "body": "string|null",
+                "json_body": "dict|null",
+                "timeout_s": "int",
+                "approved": "bool",
+            },
+            permission="network_read",
+            owner_agent="supervisor",
+            timeout_s=120,
+        )
+    )
+    tools.register(
+        ToolSpec(
+            name="network_download_file",
+            func=network_download_file,
+            description="Download a URL into workspace file path.",
+            input_schema={"url": "string", "output_path": "string", "timeout_s": "int", "overwrite": "bool", "approved": "bool"},
+            permission="network_read",
+            owner_agent="supervisor",
+            timeout_s=180,
+        )
+    )
+    tools.register(
+        ToolSpec(
+            name="sqlite_query",
+            func=sqlite_query,
+            description="Execute a SELECT query against a local sqlite database.",
+            input_schema={"db_path": "string", "query": "string", "params": "list|dict|string|null", "limit": "int", "approved": "bool"},
+            permission="db_read",
+            owner_agent="supervisor",
+        )
+    )
+    tools.register(
+        ToolSpec(
+            name="sqlite_execute",
+            func=sqlite_execute,
+            description="Execute non-SELECT SQL statements against local sqlite database.",
+            input_schema={"db_path": "string", "statement": "string", "params": "list|dict|string|null", "approved": "bool"},
+            permission="db_write",
+            owner_agent="supervisor",
+        )
+    )
+    tools.register(
+        ToolSpec(
+            name="browser_open_page",
+            func=browser_open_page,
+            description="Open a web page (lightweight browser) and store page state.",
+            input_schema={"url": "string", "timeout_s": "int", "approved": "bool"},
+            permission="browser_read",
+            owner_agent="supervisor",
+            timeout_s=120,
+        )
+    )
+    tools.register(
+        ToolSpec(
+            name="browser_click_link",
+            func=browser_click_link,
+            description="Navigate by clicking a link from current browser state (by text or index).",
+            input_schema={"link_text": "string", "link_index": "int", "approved": "bool"},
+            permission="browser_action",
+            owner_agent="supervisor",
+            timeout_s=120,
+        )
+    )
+    tools.register(
+        ToolSpec(
+            name="browser_get_state",
+            func=browser_get_state,
+            description="Get current browser state snapshot.",
+            input_schema={},
+            permission="browser_read",
+            owner_agent="supervisor",
+        )
+    )
+    tools.register(
+        ToolSpec(
+            name="browser_find_text",
+            func=browser_find_text,
+            description="Find text pattern in current browser state preview.",
+            input_schema={"pattern": "string", "max_matches": "int"},
+            permission="browser_read",
+            owner_agent="supervisor",
+        )
+    )
+    tools.register(
+        ToolSpec(
+            name="observe_git_diff",
+            func=observe_git_diff,
+            description="Observe current git diff and changed files.",
+            input_schema={"pathspec": "string", "max_chars": "int"},
+            permission="observe_read",
+            owner_agent="supervisor",
+        )
+    )
+    tools.register(
+        ToolSpec(
+            name="observe_error_logs",
+            func=observe_error_logs,
+            description="Observe error-like entries from .log files in workspace.",
+            input_schema={"pattern": "string", "top_k": "int"},
+            permission="observe_read",
+            owner_agent="supervisor",
+        )
+    )
+    tools.register(
+        ToolSpec(
+            name="observe_recent_events",
+            func=observe_recent_events,
+            description="Observe recent workflow events by trace id or across traces.",
+            input_schema={"trace_id": "string", "limit": "int"},
+            permission="observe_read",
+            owner_agent="supervisor",
+        )
+    )
+    tools.register(
+        ToolSpec(
+            name="observe_browser_state",
+            func=observe_browser_state,
+            description="Observe current browser state (alias of browser_get_state).",
+            input_schema={},
+            permission="observe_read",
+            owner_agent="supervisor",
+        )
+    )
+    tools.register(
+        ToolSpec(
             name="read_text_file",
             func=read_text_file,
             description="Read a text/markdown/source file.",
@@ -4399,6 +5903,18 @@ if __name__ == "__main__":
             input_schema={"path": "string", "max_rows": "int", "timeout_s": "int"},
             permission="code_exec",
             owner_agent="code_agent",
+            timeout_s=240,
+            retry=0,
+        )
+    )
+    tools.register(
+        ToolSpec(
+            name="prepare_logistic_regression_demo",
+            func=prepare_logistic_regression_demo,
+            description="Prepare a binary dataset (download with fallback to synthetic), train logistic regression with numpy, and save artifacts.",
+            input_schema={"task": "string", "output_path": "string", "max_rows": "int"},
+            permission="ml_train",
+            owner_agent="trainer",
             timeout_s=240,
             retry=0,
         )
@@ -4474,6 +5990,46 @@ if __name__ == "__main__":
             description="Ingest a local .md/.txt file into knowledge memory.",
             input_schema={"path": "string", "title": "string|null"},
             permission="kb_write",
+            owner_agent="kb_retriever",
+        )
+    )
+    tools.register(
+        ToolSpec(
+            name="knowledge_add_reference",
+            func=knowledge_add_reference,
+            description="Ingest product/domain/API/style reference file into knowledge memory with metadata.",
+            input_schema={"path": "string", "title": "string|null", "category": "string", "tags": "list[string]|null"},
+            permission="kb_write",
+            owner_agent="kb_retriever",
+        )
+    )
+    tools.register(
+        ToolSpec(
+            name="knowledge_ingest_workspace_docs",
+            func=knowledge_ingest_workspace_docs,
+            description="Bulk ingest workspace docs into knowledge memory.",
+            input_schema={"pattern": "string", "recursive": "bool", "limit": "int", "category": "string"},
+            permission="kb_write",
+            owner_agent="kb_retriever",
+        )
+    )
+    tools.register(
+        ToolSpec(
+            name="knowledge_list_sources",
+            func=knowledge_list_sources,
+            description="List knowledge sources and metadata.",
+            input_schema={"limit": "int"},
+            permission="kb_read",
+            owner_agent="kb_retriever",
+        )
+    )
+    tools.register(
+        ToolSpec(
+            name="knowledge_get_doc",
+            func=knowledge_get_doc,
+            description="Get one knowledge document by id.",
+            input_schema={"doc_id": "string", "max_chars": "int"},
+            permission="kb_read",
             owner_agent="kb_retriever",
         )
     )
