@@ -31,6 +31,16 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def resolve_runtime_dir(workspace: Path, preferred: str, legacy: str) -> Path:
+    preferred_path = workspace / preferred
+    legacy_path = workspace / legacy
+    if preferred_path.exists():
+        return preferred_path
+    if legacy_path.exists():
+        return legacy_path
+    return preferred_path
+
+
 def stable_score(seed_text: str, low: float, high: float) -> float:
     digest = hashlib.sha256(seed_text.encode("utf-8")).hexdigest()
     value = int(digest[:8], 16) / 0xFFFFFFFF
@@ -1236,7 +1246,7 @@ class ExecutionPolicy:
 class ExperienceAgent(BaseAgent):
     """
     Captures solved-problem experience and proposes reusable skill candidates.
-    Persists entries under `.skills/experience_catalog.json`.
+    Persists entries under `skills/experience_catalog.json`.
     """
 
     def __init__(self, memory: MemoryStore, workspace: str, model: str = "gpt-4o"):
@@ -1244,7 +1254,7 @@ class ExperienceAgent(BaseAgent):
         self.memory = memory
         self.workspace = Path(workspace).expanduser().resolve()
         self.model = model
-        self.catalog_path = self.workspace / ".skills" / "experience_catalog.json"
+        self.catalog_path = self.workspace / "skills" / "experience_catalog.json"
         self.catalog_path.parent.mkdir(parents=True, exist_ok=True)
         self.client = None
         api_key = os.getenv("OPENAI_API_KEY", "").strip()
@@ -3947,8 +3957,8 @@ class Supervisor:
 
 def build_tool_registry(memory: MemoryStore, workspace: str) -> ToolRegistry:
     tools = ToolRegistry()
-    skill_store = SkillStore(root=os.path.join(workspace, ".skills"))
     workspace_path = Path(workspace).expanduser().resolve()
+    skill_store = SkillStore(root=str(workspace_path / "skills"))
 
     def resolve_workspace_file(path: str) -> Path:
         p = Path(path).expanduser()
@@ -4760,7 +4770,7 @@ def build_tool_registry(memory: MemoryStore, workspace: str) -> ToolRegistry:
         if not p.exists() or not p.is_file():
             return {"ok": False, "error": f"file not found: {p}"}
 
-        tmp_dir = workspace_path / ".tmp"
+        tmp_dir = resolve_runtime_dir(workspace_path, "tmp", ".tmp")
         tmp_dir.mkdir(parents=True, exist_ok=True)
         script_path = tmp_dir / f"tabular_analyzer_{now_ms()}.py"
 
@@ -6169,7 +6179,7 @@ if __name__ == "__main__":
         ToolSpec(
             name="skill_list_installed",
             func=skill_list_installed,
-            description="List skills installed in local .skills directory.",
+            description="List skills installed in local skills directory.",
             input_schema={},
             permission="skill_read",
             owner_agent="supervisor",
