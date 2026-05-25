@@ -11,7 +11,7 @@ Modern agent systems often fail because control logic is overfit to brittle inte
 
 ```mermaid
 flowchart TD
-    U[User Request] --> M[messages[]]
+    U[User Request] --> M["messages[]"]
     M --> L[LLM Controller]
     L --> R{tool_use?}
     R -- yes --> T[Execute Tool Calls]
