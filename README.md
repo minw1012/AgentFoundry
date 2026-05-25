@@ -9,7 +9,7 @@ Modern agent systems often fail because control logic is overfit to brittle inte
 
 ## Summary Figure
 
-![Publication-style summary figure](docs/assets/summary-figure.svg)
+![Publication-style summary figure](model_driven_tool_runtime.svg)
 
 The model is responsible for control decisions.
 The runtime is responsible for execution, safety checks, and state updates.
