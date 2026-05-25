@@ -1,0 +1,116 @@
+{
+  "skills": [
+    {
+      "name": "content-research-writer",
+      "repo_url": "https://github.com/ComposioHQ/awesome-codex-skills",
+      "path": "/Users/max/Documents/multiagents/.skills/content-research-writer",
+      "ref": "master",
+      "commit": "",
+      "installed_at_ms": 0
+    },
+    {
+      "name": "data-preprocessing-playbook",
+      "repo_url": "local_custom",
+      "path": "/Users/max/Documents/multiagents/.skills/data-preprocessing-playbook",
+      "ref": "local",
+      "commit": "",
+      "installed_at_ms": 0
+    },
+    {
+      "name": "developer-growth-analysis",
+      "repo_url": "https://github.com/ComposioHQ/awesome-codex-skills",
+      "path": "/Users/max/Documents/multiagents/.skills/developer-growth-analysis",
+      "ref": "master",
+      "commit": "",
+      "installed_at_ms": 0
+    },
+    {
+      "name": "document-analysis-pro",
+      "repo_url": "local_custom",
+      "path": "/Users/max/Documents/multiagents/.skills/document-analysis-pro",
+      "ref": "local",
+      "commit": "",
+      "installed_at_ms": 0
+    },
+    {
+      "name": "invoice-organizer",
+      "repo_url": "https://github.com/ComposioHQ/awesome-codex-skills",
+      "path": "/Users/max/Documents/multiagents/.skills/invoice-organizer",
+      "ref": "master",
+      "commit": "",
+      "installed_at_ms": 0
+    },
+    {
+      "name": "jupyter-notebook",
+      "repo_url": "https://github.com/openai/skills",
+      "path": "/Users/max/Documents/multiagents/.skills/jupyter-notebook",
+      "ref": "main",
+      "commit": "",
+      "installed_at_ms": 0
+    },
+    {
+      "name": "langsmith-fetch",
+      "repo_url": "https://github.com/ComposioHQ/awesome-codex-skills",
+      "path": "/Users/max/Documents/multiagents/.skills/langsmith-fetch",
+      "ref": "master",
+      "commit": "",
+      "installed_at_ms": 0
+    },
+    {
+      "name": "ml-evaluation-playbook",
+      "repo_url": "local_custom",
+      "path": "/Users/max/Documents/multiagents/.skills/ml-evaluation-playbook",
+      "ref": "local",
+      "commit": "",
+      "installed_at_ms": 0
+    },
+    {
+      "name": "ml-model-selection-playbook",
+      "repo_url": "local_custom",
+      "path": "/Users/max/Documents/multiagents/.skills/ml-model-selection-playbook",
+      "ref": "local",
+      "commit": "",
+      "installed_at_ms": 0
+    },
+    {
+      "name": "ml-training-playbook",
+      "repo_url": "local_custom",
+      "path": "/Users/max/Documents/multiagents/.skills/ml-training-playbook",
+      "ref": "local",
+      "commit": "",
+      "installed_at_ms": 0
+    },
+    {
+      "name": "notion-research-documentation",
+      "repo_url": "https://github.com/openai/skills",
+      "path": "/Users/max/Documents/multiagents/.skills/notion-research-documentation",
+      "ref": "main",
+      "commit": "",
+      "installed_at_ms": 0
+    },
+    {
+      "name": "openai-docs",
+      "repo_url": "https://github.com/openai/skills",
+      "path": "/Users/max/Documents/multiagents/.skills/openai-docs",
+      "ref": "main",
+      "commit": "",
+      "installed_at_ms": 0
+    },
+    {
+      "name": "pdf",
+      "repo_url": "https://github.com/openai/skills",
+      "path": "/Users/max/Documents/multiagents/.skills/pdf",
+      "ref": "main",
+      "commit": "",
+      "installed_at_ms": 0
+    },
+    {
+      "name": "spreadsheet-formula-helper",
+      "repo_url": "https://github.com/ComposioHQ/awesome-codex-skills",
+      "path": "/Users/max/Documents/multiagents/.skills/spreadsheet-formula-helper",
+      "ref": "master",
+      "commit": "",
+      "installed_at_ms": 0
+    }
+  ]
+}
