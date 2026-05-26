@@ -88,6 +88,15 @@ python3 terminal_chat.py --workspace . --model gpt-4o
 
 `--workspace .` scopes default file and tool operations to the current directory.
 
+### 1b) Start web chatbot (no terminal needed)
+
+```bash
+python3 web_chat.py --workspace . --model gpt-4o --host 127.0.0.1 --port 7860 --open
+```
+
+Then open `http://127.0.0.1:7860` in browser if `--open` is not used.
+The web app uses the same `MultiAgentSystem` runtime and tool execution flow.
+
 ### 2) Use built-in commands
 - `/help`
 - `/tools`

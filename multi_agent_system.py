@@ -1705,6 +1705,16 @@ class DynamicLoopOrchestrator:
             )
         return calls
 
+    def _is_zero_data_retention_error(self, error: Exception) -> bool:
+        text = str(error or "").lower()
+        markers = [
+            "zero data retention",
+            "zdr",
+            "previous_response_id",
+            "response continuation is not allowed",
+        ]
+        return any(marker in text for marker in markers)
+
     def _run_model_tool_loop(
         self,
         task: str,
@@ -1926,6 +1936,49 @@ class DynamicLoopOrchestrator:
                     temperature=0,
                 )
             except Exception as e:
+                if self._is_zero_data_retention_error(e):
+                    # ZDR-compatible retry: avoid previous_response_id and continue with explicit state.
+                    self._record_event(
+                        trace_id,
+                        "zdr_retry",
+                        {
+                            "iteration": iteration,
+                            "reason": truncate_text(str(e), max_chars=240),
+                        },
+                    )
+                    try:
+                        retry_payload = {
+                            "task": task,
+                            "instruction": (
+                                "Continue from the latest tool outputs. "
+                                "Call additional tools only if needed, otherwise return final answer."
+                            ),
+                            "latest_tool_outputs": outputs_for_model,
+                            "observations_tail": observations[-6:],
+                        }
+                        response = self.client.responses.create(
+                            model=self.model,
+                            input=[
+                                {"role": "system", "content": system_prompt},
+                                {"role": "user", "content": json.dumps(retry_payload, ensure_ascii=False)},
+                            ],
+                            tools=tool_defs,
+                            temperature=0,
+                        )
+                        continue
+                    except Exception as retry_err:
+                        observations.append(
+                            {
+                                "iteration": iteration,
+                                "step": "model_followup_zdr_retry",
+                                "tool": "model",
+                                "arguments": {},
+                                "ok": False,
+                                "error": f"model follow-up ZDR retry failed: {retry_err}",
+                                "result": {},
+                            }
+                        )
+                        break
                 observations.append(
                     {
                         "iteration": iteration,
@@ -2459,8 +2512,25 @@ class DynamicLoopOrchestrator:
         if expected and tool_name and expected != tool_name:
             return False, f"selector chose `{tool_name}` but contract expects `{expected}`"
         args = ensure_dict(decision.get("arguments", {}))
+
+        def _looks_like_output_pointer(text: str) -> bool:
+            # Pointer should look like "tool_name.field" and not like filesystem paths or urls.
+            s = (text or "").strip()
+            if not s or "." not in s:
+                return False
+            if "/" in s or "\\" in s or "://" in s:
+                return False
+            head = s.split(".", 1)[0].strip()
+            if not head:
+                return False
+            return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", head))
+
         for key, value in args.items():
-            if isinstance(value, str) and "." in value and value.split(".")[0] not in loop_state.get("tool_outputs", {}):
+            if (
+                isinstance(value, str)
+                and _looks_like_output_pointer(value)
+                and value.split(".", 1)[0] not in loop_state.get("tool_outputs", {})
+            ):
                 return False, f"argument `{key}` points to unresolved output `{value}`"
         return True, "preconditions_ok"
 
