@@ -9,7 +9,7 @@ Modern agent systems often fail because control logic is overfit to brittle inte
 
 ## Summary Figure
 
-![Publication-style summary figure](model_driven_tool_runtime.svg)
+![Publication-style summary figure](dynamic_controller_loop.svg)
 
 The model is responsible for control decisions.
 The runtime is responsible for execution, safety checks, and state updates.
@@ -25,7 +25,6 @@ Harness = Tools + Knowledge + Observation + Action Interfaces + Permissions
 
 ### Runtime Components
 - `DynamicLoopOrchestrator`: primary controller with model-native tool loop and fallback execution path.
-- `MCTS plan optimizer`: searches multiple candidate plans and selects higher-scoring execution workflows before runtime.
 - `Constraint/Verifier/Selector pipeline`:
   - `constraint_agent` builds per-step contracts (preconditions/postconditions).
   - `selector_agent` dynamically chooses reasoning/tool/code/clarification actions.
