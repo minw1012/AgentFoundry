@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 import csv
-import hashlib
 import heapq
 import json
 import logging
@@ -40,12 +39,6 @@ def resolve_runtime_dir(workspace: Path, preferred: str, legacy: str) -> Path:
     if legacy_path.exists():
         return legacy_path
     return preferred_path
-
-
-def stable_score(seed_text: str, low: float, high: float) -> float:
-    digest = hashlib.sha256(seed_text.encode("utf-8")).hexdigest()
-    value = int(digest[:8], 16) / 0xFFFFFFFF
-    return round(low + (high - low) * value, 4)
 
 
 def parse_bool(value: Any, default: bool = False) -> bool:
@@ -2592,17 +2585,22 @@ class DynamicLoopOrchestrator:
     def _selector_agent(self, loop_state: Dict[str, Any]) -> Dict[str, Any]:
         raw = self.decide_next_action(loop_state)
         decision = str(raw.get("decision", "FINAL")).upper()
-        if decision not in {"TOOL", "FINAL", "CLARIFY"}:
+        if decision not in {"TOOL", "CODE", "REASON", "FINAL", "CLARIFY"}:
             decision = "FINAL"
-        # Dynamic selection among reason/tool/code: when shell/code activity exists, bias to code execution.
+        # Dynamic selection among reason/tool/code with explicit action type.
         tool_name = str(raw.get("tool_name", "")).strip()
-        if decision == "TOOL":
+        if decision == "CODE":
+            raw["selector_mode"] = "CODE"
+            raw["tool_name"] = "run_shell_command"
+        elif decision == "TOOL":
             if tool_name == "run_shell_command":
                 raw["selector_mode"] = "CODE"
             elif tool_name:
                 raw["selector_mode"] = "TOOL"
             else:
                 raw["selector_mode"] = "REASON"
+        elif decision == "REASON":
+            raw["selector_mode"] = "REASON"
         else:
             raw["selector_mode"] = "REASON" if decision == "FINAL" else "CLARIFY"
         raw["decision"] = decision
@@ -2628,10 +2626,11 @@ class DynamicLoopOrchestrator:
             tool_name = str(step.get("tool", "")).strip()
             if not tool_name:
                 return {
-                    "decision": "FINAL",
-                    "step": step.get("step", "Finalize answer"),
+                    "decision": "REASON",
+                    "step": step.get("step", "Reasoning step"),
                     "tool_name": "",
                     "arguments": {},
+                    "reasoning_note": "",
                     "final_answer": "",
                 }
             arguments = self._resolve_arguments(ensure_dict(step.get("arguments", {})), task=task, tool_outputs=tool_outputs)
@@ -2661,16 +2660,20 @@ class DynamicLoopOrchestrator:
             },
             "tool_catalog": self.tools.catalog_for_planner(),
             "output_schema": {
-                "decision": "TOOL | FINAL | CLARIFY",
+                "decision": "REASON | TOOL | CODE | FINAL | CLARIFY",
                 "step": "string",
                 "tool_name": "string",
                 "arguments": "dict",
+                "reasoning_note": "string",
+                "code_command": "string",
                 "final_answer": "string",
                 "clarification_question": "string",
             },
             "rules": [
-                "Prefer finishing early if success criteria are met.",
+                "Always decide from plan context first, not from generic defaults.",
+                "Action priority: REASON if no execution needed now; TOOL if an existing tool can complete current step; CODE only when no suitable tool or custom computation/plot/script is needed; CLARIFY if key inputs are missing; FINAL only when success criteria are satisfied.",
                 "When decision=TOOL, tool_name must exist in tool_catalog and arguments must be executable.",
+                "When decision=CODE, return code_command as a runnable shell command and optional timeout_s in arguments.",
                 "Never invent tools.",
                 "Avoid repetitive failing calls: if blocked, use CLARIFY.",
             ],
@@ -2681,21 +2684,35 @@ class DynamicLoopOrchestrator:
             return self.decide_next_action(loop_state)
 
         decision = str(parsed.get("decision", "FINAL")).upper()
-        if decision not in {"TOOL", "FINAL", "CLARIFY"}:
+        if decision not in {"REASON", "TOOL", "CODE", "FINAL", "CLARIFY"}:
             decision = "FINAL"
         tool_name = str(parsed.get("tool_name", "")).strip()
         arguments = ensure_dict(parsed.get("arguments", {}))
+        reasoning_note = str(parsed.get("reasoning_note", "")).strip()
+        code_command = str(parsed.get("code_command", "")).strip()
         final_answer = str(parsed.get("final_answer", "")).strip()
         clarification_question = str(parsed.get("clarification_question", "")).strip()
         step = str(parsed.get("step", "")).strip() or "Execute next action"
         if decision == "TOOL" and tool_name not in self.tools.tools:
-            decision = "CLARIFY"
-            clarification_question = clarification_question or "I need a valid tool/action target before continuing."
+            if code_command:
+                decision = "CODE"
+            else:
+                decision = "CLARIFY"
+                clarification_question = clarification_question or "I need a valid tool/action target before continuing."
+        if decision == "CODE":
+            tool_name = "run_shell_command"
+            merged = dict(arguments)
+            if code_command:
+                merged["command"] = code_command
+            merged.setdefault("timeout_s", 120)
+            arguments = merged
         return {
             "decision": decision,
             "step": step,
             "tool_name": tool_name,
             "arguments": arguments,
+            "reasoning_note": reasoning_note,
+            "code_command": code_command,
             "final_answer": final_answer,
             "clarification_question": clarification_question,
         }
@@ -3149,6 +3166,62 @@ class DynamicLoopOrchestrator:
                     loop_state=loop_state,
                 )
                 return response
+
+            if decision.get("decision") == "REASON":
+                note = str(decision.get("reasoning_note", "")).strip() or str(decision.get("step", "Reasoning step")).strip()
+                obs = {
+                    "iteration": iteration,
+                    "step": decision.get("step", "Reasoning step"),
+                    "tool": "reasoning",
+                    "arguments": {},
+                    "ok": True,
+                    "error": "",
+                    "result": {"note": note},
+                    "result_preview": truncate_text(note, max_chars=300),
+                }
+                loop_state["observations"].append(obs)
+                loop_state["events"].append(
+                    self._record_event(
+                        trace_id,
+                        "observation",
+                        {"iteration": iteration, "tool": "reasoning", "ok": True, "result_preview": truncate_text(note, max_chars=220)},
+                    )
+                )
+                loop_state["plan_cursor"] = int(loop_state.get("plan_cursor", 0)) + 1
+                continue
+
+            if decision.get("decision") == "CODE":
+                code_args = ensure_dict(decision.get("arguments", {}))
+                command = str(code_args.get("command", "")).strip()
+                if not command:
+                    command = str(decision.get("code_command", "")).strip()
+                if not command:
+                    loop_state["status"] = "clarification_needed"
+                    self._record_event(trace_id, "finish", {"status": "code_command_missing", "iteration": iteration})
+                    response = {
+                        "intent": "GENERAL_CHAT",
+                        "reply": "I can execute code for this step, but I still need a concrete command or script objective.",
+                        "suggestions": DEFAULT_CLARIFICATION_SUGGESTIONS,
+                        "planner_mode": "CODE_COMMAND_MISSING",
+                        "goal": loop_state["goal"],
+                        "trace_id": trace_id,
+                        "event_log_tail": self.memory.get_workflow_events(trace_id, limit=20),
+                    }
+                    self._capture_experience(
+                        session_id=session_id,
+                        trace_id=trace_id,
+                        task=task,
+                        response=response,
+                        loop_state=loop_state,
+                    )
+                    return response
+                decision["tool_name"] = "run_shell_command"
+                decision["arguments"] = {
+                    "command": command,
+                    "timeout_s": int(code_args.get("timeout_s", 120) or 120),
+                    "approved": bool(code_args.get("approved", False)),
+                }
+                decision["decision"] = "TOOL"
 
             if decision.get("decision") != "TOOL":
                 loop_state["status"] = "completed"
@@ -3956,10 +4029,13 @@ class WorkflowControllerAgent(BaseAgent):
             evaluation_result = artifacts.get("evaluation_result", {})
             report = artifacts.get("report", {})
             metrics = evaluation_result.get("all_metrics", report.get("metrics", []))
+            workflow_ok = bool(evaluation_result.get("ok", False)) and bool(report.get("ok", False))
+            selected_models = artifacts.get("selected_models", [])
+            selected_top = selected_models[0] if isinstance(selected_models, list) and selected_models else None
             best_model = (
                 evaluation_result.get("best", {}).get("model")
                 or report.get("best_model")
-                or (artifacts.get("selected_models", [None])[0])
+                or selected_top
                 or "N/A"
             )
 
@@ -3976,7 +4052,15 @@ class WorkflowControllerAgent(BaseAgent):
                 "priority": 80,
                 "content": {
                     "intent": workflow_intent if workflow_intent else "ML_WORKFLOW",
-                    "summary": "Dynamic ML workflow finished based on user requirements.",
+                    "status": "completed" if workflow_ok else "failed",
+                    "summary": (
+                        "Dynamic ML workflow completed with verified training/evaluation artifacts."
+                        if workflow_ok
+                        else (
+                            "Dynamic ML workflow did not complete successfully. "
+                            + str(report.get("error") or evaluation_result.get("error") or "Missing required dataset evidence.")
+                        )
+                    ),
                     "executed_steps": state.get("executed_steps", []),
                     "requirements": state.get("requirements", {}),
                     "best_model": best_model,
@@ -4024,7 +4108,7 @@ class DataAgent(BaseAgent):
 
         updates: Dict[str, Any] = {}
         if step_kind == "data_prep":
-            data_result = self.tools.execute("process_data", task=task)
+            data_result = self.tools.execute("process_data", task=task, mode_hint=state.get("requirements", {}).get("mode_hint"))
             state["data"] = data_result
             updates["data_profile"] = data_result
         elif step_kind == "feature_engineering":
@@ -4059,7 +4143,7 @@ class ModelAgent(BaseAgent):
 
         updates: Dict[str, Any] = {}
         if step_kind == "model_selection":
-            data_profile = artifacts.get("data_profile", {"mode": "classification"})
+            data_profile = artifacts.get("data_profile", {})
             picked = self.tools.execute(
                 "model_suggest",
                 task=task,
@@ -4068,7 +4152,10 @@ class ModelAgent(BaseAgent):
             )
             state["model_candidates"] = picked
             updates["model_candidates"] = picked
-            updates["selected_models"] = picked["models"]
+            if isinstance(picked, dict):
+                updates["selected_models"] = picked.get("models", [])
+            else:
+                updates["selected_models"] = []
 
         return {
             "sender": self.name,
@@ -4098,12 +4185,28 @@ class TrainerAgent(BaseAgent):
         updates: Dict[str, Any] = {}
         if step_kind == "hyperparameter_tuning":
             models = artifacts.get("selected_models", [])
-            tuning_result = self.tools.execute("tune_models", task=task, models=models)
+            data_profile = artifacts.get("data_profile", {})
+            tuning_result = self.tools.execute(
+                "tune_models",
+                task=task,
+                models=models,
+                data_path=str(data_profile.get("data_path", "")),
+                target_column=str(data_profile.get("target_column", "")),
+                mode_hint=str(data_profile.get("mode", "")),
+            )
             updates["tuning_result"] = tuning_result
             updates["selected_models"] = tuning_result.get("recommended_models", models)
         elif step_kind == "training":
             models = artifacts.get("selected_models", [])
-            train_result = self.tools.execute("train_models", task=task, models=models)
+            data_profile = artifacts.get("data_profile", {})
+            train_result = self.tools.execute(
+                "train_models",
+                task=task,
+                models=models,
+                data_path=str(data_profile.get("data_path", "")),
+                target_column=str(data_profile.get("target_column", "")),
+                mode_hint=str(data_profile.get("mode", "")),
+            )
             state["train_result"] = train_result
             updates["train_result"] = train_result
 
@@ -5874,12 +5977,134 @@ if __name__ == "__main__":
                 break
         return {"key_points": points}
 
-    def process_data(task: str, mode_hint: Optional[str] = None) -> Dict[str, Any]:
-        mode = mode_hint if mode_hint in {"classification", "regression"} else "classification"
+    def _safe_float(raw: Any) -> Optional[float]:
+        try:
+            text = str(raw).strip()
+            if text == "":
+                return None
+            return float(text)
+        except Exception:
+            return None
+
+    def _infer_mode_from_target(values: List[Any]) -> str:
+        cleaned = [str(v).strip() for v in values if str(v).strip() != ""]
+        if not cleaned:
+            return "classification"
+        numeric = [_safe_float(v) for v in cleaned]
+        numeric_valid = [v for v in numeric if v is not None]
+        unique = set(cleaned)
+        if len(unique) <= 20:
+            return "classification"
+        if numeric_valid and len(numeric_valid) == len(cleaned):
+            return "regression"
+        return "classification"
+
+    def _resolve_ml_dataset_path(task: str, data_path: Optional[str]) -> Tuple[Optional[Path], Optional[str]]:
+        candidate = str(data_path or "").strip()
+        if not candidate:
+            candidate = resolve_spreadsheet_path_from_text(task, workspace=str(workspace_path)) or ""
+        if not candidate:
+            return None, "missing data_path: provide an explicit CSV dataset path."
+        p = resolve_workspace_file(candidate)
+        if not p.exists() or not p.is_file():
+            return None, f"file not found: {p}"
+        if p.suffix.lower() != ".csv":
+            return None, f"unsupported dataset format for ML tools: {p.suffix}. Use CSV."
+        return p, None
+
+    def _read_csv_rows(path: Path, max_rows: int = 50000) -> Tuple[List[str], List[Dict[str, str]], str]:
+        with path.open("r", encoding="utf-8", errors="ignore", newline="") as f:
+            sample = f.read(4096)
+            f.seek(0)
+            delimiter = ","
+            try:
+                dialect = csv.Sniffer().sniff(sample, delimiters=",\t;|")
+                delimiter = str(getattr(dialect, "delimiter", ",") or ",")
+                reader = csv.DictReader(f, dialect=dialect)
+            except Exception:
+                reader = csv.DictReader(f)
+            headers = [str(h).strip() for h in (reader.fieldnames or []) if str(h).strip()]
+            rows: List[Dict[str, str]] = []
+            for idx, row in enumerate(reader):
+                if idx >= max(1, min(int(max_rows or 50000), 200000)):
+                    break
+                if not isinstance(row, dict):
+                    continue
+                rows.append({str(k): "" if v is None else str(v) for k, v in row.items() if k is not None})
+        return headers, rows, delimiter
+
+    def _choose_target_column(headers: List[str], target_column: Optional[str]) -> Optional[str]:
+        if not headers:
+            return None
+        by_lower = {h.lower(): h for h in headers}
+        if target_column and str(target_column).strip():
+            key = str(target_column).strip().lower()
+            return by_lower.get(key)
+        for name in ["label", "target", "y", "class", "outcome", "prediction_target"]:
+            if name in by_lower:
+                return by_lower[name]
+        return None
+
+    def process_data(
+        task: str,
+        mode_hint: Optional[str] = None,
+        data_path: Optional[str] = None,
+        target_column: Optional[str] = None,
+        max_rows: int = 50000,
+    ) -> Dict[str, Any]:
+        p, err = _resolve_ml_dataset_path(task=task, data_path=data_path)
+        if err or p is None:
+            return {
+                "ok": False,
+                "error": err or "dataset resolution failed",
+                "missing_requirements": ["data_path"],
+                "training_ready": False,
+            }
+        headers, rows, delimiter = _read_csv_rows(path=p, max_rows=max_rows)
+        if not headers:
+            return {"ok": False, "error": "dataset has no headers", "data_path": str(p), "training_ready": False}
+        if not rows:
+            return {"ok": False, "error": "dataset has no readable rows", "data_path": str(p), "training_ready": False}
+
+        target = _choose_target_column(headers=headers, target_column=target_column)
+        missing_requirements: List[str] = []
+        if not target:
+            missing_requirements.append("target_column")
+        selected_mode = mode_hint if mode_hint in {"classification", "regression"} else (
+            _infer_mode_from_target([row.get(target, "") for row in rows]) if target else "classification"
+        )
+
+        numeric_columns = []
+        missing_by_column: Dict[str, int] = {}
+        for col in headers:
+            values = [str(row.get(col, "")).strip() for row in rows]
+            missing_by_column[col] = sum(1 for v in values if v == "")
+            if col == target:
+                continue
+            non_empty = [v for v in values if v != ""]
+            if non_empty and all(_safe_float(v) is not None for v in non_empty):
+                numeric_columns.append(col)
+
+        training_ready = len(missing_requirements) == 0 and len(rows) >= 30
         return {
-            "mode": mode,
+            "ok": training_ready,
+            "training_ready": training_ready,
+            "error": "" if training_ready else "dataset is not ready for training; see missing_requirements",
+            "missing_requirements": missing_requirements,
+            "mode": selected_mode,
+            "data_path": str(p),
+            "target_column": target or "",
+            "row_count": len(rows),
+            "column_count": len(headers),
+            "columns": headers,
+            "numeric_columns": numeric_columns[:100],
+            "missing_by_column": missing_by_column,
             "cleaning_steps": ["drop_duplicates", "impute_missing", "standardize_numeric"],
             "split": {"train": 0.7, "valid": 0.15, "test": 0.15},
+            "evidence": {
+                "inputs": {"data_path": str(p), "target_column": target or ""},
+                "stats": {"rows": len(rows), "columns": len(headers), "delimiter": delimiter},
+            },
         }
 
     def feature_plan(task: str, data_profile: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -5895,67 +6120,307 @@ if __name__ == "__main__":
         data_profile: Optional[Dict[str, Any]] = None,
         model_hint: Optional[str] = None,
     ) -> Dict[str, Any]:
-        mode = (data_profile or {}).get("mode", "classification")
+        profile = data_profile or {}
+        if not profile.get("data_path"):
+            return {"ok": False, "error": "data_profile missing data_path; run process_data first."}
+        if not profile.get("target_column"):
+            return {"ok": False, "error": "data_profile missing target_column; provide target column."}
+        mode = str(profile.get("mode", "classification"))
         if mode == "classification":
-            models = ["LogisticRegression", "RandomForestClassifier", "XGBoostClassifier"]
+            models = ["LogisticRegression", "RandomForestClassifier", "GradientBoostingClassifier"]
         else:
-            models = ["LinearRegression", "RandomForestRegressor", "XGBoostRegressor"]
+            models = ["LinearRegression", "RandomForestRegressor", "GradientBoostingRegressor"]
 
         if model_hint:
             canonical = {
                 "logisticregression": "LogisticRegression",
                 "randomforestclassifier": "RandomForestClassifier",
-                "xgboostclassifier": "XGBoostClassifier",
+                "gradientboostingclassifier": "GradientBoostingClassifier",
                 "linearregression": "LinearRegression",
                 "randomforestregressor": "RandomForestRegressor",
-                "xgboostregressor": "XGBoostRegressor",
+                "gradientboostingregressor": "GradientBoostingRegressor",
             }.get(model_hint.lower().replace(" ", ""), model_hint)
             models = [canonical] + [m for m in models if m != canonical]
-        return {"models": models}
+        return {"ok": True, "models": models, "mode": mode, "evidence": {"inputs": profile.get("evidence", {}).get("inputs", {})}}
 
-    def tune_models(task: str, models: List[str]) -> Dict[str, Any]:
+    def tune_models(
+        task: str,
+        models: List[str],
+        data_path: Optional[str] = None,
+        target_column: Optional[str] = None,
+        mode_hint: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        p, err = _resolve_ml_dataset_path(task=task, data_path=data_path)
+        if err or p is None:
+            return {"ok": False, "error": err or "dataset resolution failed", "missing_requirements": ["data_path"]}
+        target = str(target_column or "").strip()
+        if not target:
+            return {"ok": False, "error": "target_column is required for tuning plan", "missing_requirements": ["target_column"]}
         if not models:
             models = ["LogisticRegression", "RandomForestClassifier"]
-        tuned = []
-        for model in models:
-            score = stable_score(task + model + "_tuned", 0.01, 0.20)
-            tuned.append({"model": model, "expected_gain": score})
-        tuned.sort(key=lambda x: x["expected_gain"], reverse=True)
-        recommended = [x["model"] for x in tuned[:2]]
-        return {"recommended_models": recommended, "tuning_candidates": tuned}
+        search_space: Dict[str, Dict[str, List[Any]]] = {
+            "LogisticRegression": {"C": [0.1, 1.0, 10.0], "max_iter": [200, 500]},
+            "RandomForestClassifier": {"n_estimators": [100, 300], "max_depth": [None, 10, 20]},
+            "GradientBoostingClassifier": {"n_estimators": [100, 300], "learning_rate": [0.03, 0.1]},
+            "LinearRegression": {"fit_intercept": [True, False]},
+            "RandomForestRegressor": {"n_estimators": [100, 300], "max_depth": [None, 10, 20]},
+            "GradientBoostingRegressor": {"n_estimators": [100, 300], "learning_rate": [0.03, 0.1]},
+        }
+        plan = [{"model": m, "grid": search_space.get(m, {})} for m in models]
+        recommended = [m for m in models if search_space.get(m)][:2] or models[:2]
+        return {
+            "ok": True,
+            "mode": mode_hint or "auto",
+            "recommended_models": recommended,
+            "tuning_candidates": plan,
+            "evidence": {"inputs": {"data_path": str(p), "target_column": target}},
+        }
 
-    def train_models(task: str, models: List[str]) -> Dict[str, Any]:
-        if not models:
-            models = ["LogisticRegression", "RandomForestClassifier", "XGBoostClassifier"]
-        rows = []
-        for m in models:
-            if "Classifier" in m or m == "LogisticRegression":
-                metric = stable_score(task + m, 0.78, 0.95)
-                rows.append({"model": m, "metric_name": "f1", "metric_value": metric})
+    def train_models(
+        task: str,
+        models: List[str],
+        data_path: Optional[str] = None,
+        target_column: Optional[str] = None,
+        mode_hint: Optional[str] = None,
+        test_size: float = 0.2,
+        random_state: int = 42,
+    ) -> Dict[str, Any]:
+        p, err = _resolve_ml_dataset_path(task=task, data_path=data_path)
+        if err or p is None:
+            return {"ok": False, "error": err or "dataset resolution failed", "missing_requirements": ["data_path"]}
+        headers, rows, _ = _read_csv_rows(path=p, max_rows=200000)
+        if not headers or not rows:
+            return {"ok": False, "error": "dataset has no readable rows", "data_path": str(p)}
+
+        target = _choose_target_column(headers=headers, target_column=target_column)
+        if not target:
+            return {"ok": False, "error": "target_column is required and was not detected.", "missing_requirements": ["target_column"]}
+
+        raw_features: List[Dict[str, Any]] = []
+        raw_targets: List[str] = []
+        for row in rows:
+            y = str(row.get(target, "")).strip()
+            if y == "":
+                continue
+            features: Dict[str, Any] = {}
+            for col in headers:
+                if col == target:
+                    continue
+                cell = str(row.get(col, "")).strip()
+                if cell == "":
+                    continue
+                as_float = _safe_float(cell)
+                features[col] = as_float if as_float is not None else cell
+            raw_features.append(features)
+            raw_targets.append(y)
+        if len(raw_features) < 30:
+            return {"ok": False, "error": "insufficient labeled rows (<30) after filtering.", "data_path": str(p)}
+
+        mode = mode_hint if mode_hint in {"classification", "regression"} else _infer_mode_from_target(raw_targets)
+        features: List[Dict[str, Any]] = []
+        targets: List[Any] = []
+        label_mapping: Dict[str, int] = {}
+        if mode == "classification":
+            unique_labels = sorted(set(raw_targets))
+            if len(unique_labels) < 2:
+                return {"ok": False, "error": "classification requires at least two target classes."}
+            label_mapping = {label: idx for idx, label in enumerate(unique_labels)}
+            for feat, y in zip(raw_features, raw_targets):
+                features.append(feat)
+                targets.append(label_mapping[y])
+        else:
+            for feat, y in zip(raw_features, raw_targets):
+                y_num = _safe_float(y)
+                if y_num is None:
+                    continue
+                features.append(feat)
+                targets.append(y_num)
+            if len(features) < 30:
+                return {"ok": False, "error": "regression target has too many non-numeric values."}
+
+        try:
+            from sklearn.ensemble import (
+                GradientBoostingClassifier,
+                GradientBoostingRegressor,
+                RandomForestClassifier,
+                RandomForestRegressor,
+            )
+            from sklearn.feature_extraction import DictVectorizer
+            from sklearn.linear_model import LinearRegression, LogisticRegression
+            from sklearn.metrics import (
+                accuracy_score,
+                f1_score,
+                mean_squared_error,
+                precision_score,
+                r2_score,
+                recall_score,
+            )
+            from sklearn.model_selection import train_test_split
+        except Exception as e:
+            return {
+                "ok": False,
+                "error": (
+                    f"scikit-learn is required for real model training: {e}. "
+                    "Install dependencies, then retry."
+                ),
+            }
+
+        vec = DictVectorizer(sparse=False)
+        x_all = vec.fit_transform(features)
+        y_all = targets
+        ts = min(0.4, max(0.1, float(test_size or 0.2)))
+        try:
+            if mode == "classification":
+                x_train, x_test, y_train, y_test = train_test_split(
+                    x_all,
+                    y_all,
+                    test_size=ts,
+                    random_state=int(random_state or 42),
+                    stratify=y_all,
+                )
             else:
-                metric = stable_score(task + m, 0.05, 0.30)
-                rows.append({"model": m, "metric_name": "rmse", "metric_value": metric})
-        return {"runs": rows}
+                x_train, x_test, y_train, y_test = train_test_split(
+                    x_all,
+                    y_all,
+                    test_size=ts,
+                    random_state=int(random_state or 42),
+                )
+        except Exception as e:
+            return {"ok": False, "error": f"failed to split dataset: {e}"}
 
-    def evaluate_models(task: str, train_result: Dict[str, Any]) -> Dict[str, Any]:
-        runs = train_result.get("runs", [])
+        if not models:
+            models = (
+                ["LogisticRegression", "RandomForestClassifier", "GradientBoostingClassifier"]
+                if mode == "classification"
+                else ["LinearRegression", "RandomForestRegressor", "GradientBoostingRegressor"]
+            )
+        canonical_map = {
+            "logisticregression": "LogisticRegression",
+            "randomforestclassifier": "RandomForestClassifier",
+            "gradientboostingclassifier": "GradientBoostingClassifier",
+            "linearregression": "LinearRegression",
+            "randomforestregressor": "RandomForestRegressor",
+            "gradientboostingregressor": "GradientBoostingRegressor",
+        }
+        chosen = [canonical_map.get(str(m).lower().replace(" ", ""), str(m)) for m in models]
+
+        runs: List[Dict[str, Any]] = []
+        failures: List[str] = []
+        for name in chosen:
+            try:
+                if mode == "classification":
+                    if name == "LogisticRegression":
+                        estimator = LogisticRegression(max_iter=500)
+                    elif name == "RandomForestClassifier":
+                        estimator = RandomForestClassifier(n_estimators=300, random_state=int(random_state or 42))
+                    elif name == "GradientBoostingClassifier":
+                        estimator = GradientBoostingClassifier(random_state=int(random_state or 42))
+                    else:
+                        failures.append(f"unsupported classification model: {name}")
+                        continue
+                    estimator.fit(x_train, y_train)
+                    preds = estimator.predict(x_test)
+                    f1 = float(f1_score(y_test, preds, average="weighted", zero_division=0))
+                    acc = float(accuracy_score(y_test, preds))
+                    prec = float(precision_score(y_test, preds, average="weighted", zero_division=0))
+                    rec = float(recall_score(y_test, preds, average="weighted", zero_division=0))
+                    runs.append(
+                        {
+                            "model": name,
+                            "metric_name": "f1_weighted",
+                            "metric_value": round(f1, 6),
+                            "metrics": {
+                                "f1_weighted": round(f1, 6),
+                                "accuracy": round(acc, 6),
+                                "precision_weighted": round(prec, 6),
+                                "recall_weighted": round(rec, 6),
+                            },
+                        }
+                    )
+                else:
+                    if name == "LinearRegression":
+                        estimator = LinearRegression()
+                    elif name == "RandomForestRegressor":
+                        estimator = RandomForestRegressor(n_estimators=300, random_state=int(random_state or 42))
+                    elif name == "GradientBoostingRegressor":
+                        estimator = GradientBoostingRegressor(random_state=int(random_state or 42))
+                    else:
+                        failures.append(f"unsupported regression model: {name}")
+                        continue
+                    estimator.fit(x_train, y_train)
+                    preds = estimator.predict(x_test)
+                    mse = float(mean_squared_error(y_test, preds))
+                    rmse = math.sqrt(max(0.0, mse))
+                    r2 = float(r2_score(y_test, preds))
+                    runs.append(
+                        {
+                            "model": name,
+                            "metric_name": "rmse",
+                            "metric_value": round(rmse, 6),
+                            "metrics": {"rmse": round(rmse, 6), "r2": round(r2, 6)},
+                        }
+                    )
+            except Exception as e:
+                failures.append(f"{name}: {e}")
+
         if not runs:
             return {
-                "best": {"model": "N/A", "metric_name": "n/a", "metric_value": None},
-                "objective": "maximize",
-                "all_metrics": [],
-                "warning": "No training runs available for evaluation.",
+                "ok": False,
+                "error": "no model was trained successfully",
+                "failures": failures[:10],
+                "evidence": {"inputs": {"data_path": str(p), "target_column": target}},
             }
-        cls_mode = any(r["metric_name"] == "f1" for r in runs)
-        if cls_mode:
-            best = max(runs, key=lambda r: r["metric_value"])
-            objective = "maximize"
-        else:
-            best = min(runs, key=lambda r: r["metric_value"])
-            objective = "minimize"
-        return {"best": best, "objective": objective, "all_metrics": runs}
+
+        return {
+            "ok": True,
+            "mode": mode,
+            "runs": runs,
+            "warnings": failures[:10],
+            "evidence": {
+                "inputs": {"data_path": str(p), "target_column": target},
+                "stats": {
+                    "rows_total": len(features),
+                    "rows_train": len(y_train),
+                    "rows_test": len(y_test),
+                    "feature_count": int(x_all.shape[1]),
+                },
+                "label_mapping": label_mapping if mode == "classification" else {},
+            },
+        }
+
+    def evaluate_models(task: str, train_result: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(train_result, dict) or not train_result.get("ok", False):
+            return {
+                "ok": False,
+                "error": "train_result is not successful; cannot evaluate.",
+                "all_metrics": [],
+                "best": {},
+            }
+        runs = train_result.get("runs", [])
+        if not isinstance(runs, list) or not runs:
+            return {
+                "ok": False,
+                "error": "No training runs available for evaluation.",
+                "all_metrics": [],
+                "best": {},
+            }
+        main_metric = str(runs[0].get("metric_name", "")).lower()
+        minimize = main_metric in {"rmse", "mae", "mse"}
+        best = min(runs, key=lambda r: float(r.get("metric_value", 0.0))) if minimize else max(
+            runs, key=lambda r: float(r.get("metric_value", 0.0))
+        )
+        return {
+            "ok": True,
+            "best": best,
+            "objective": "minimize" if minimize else "maximize",
+            "all_metrics": runs,
+            "warnings": train_result.get("warnings", []),
+            "evidence": train_result.get("evidence", {}),
+        }
 
     def error_analyze(task: str, evaluation_result: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(evaluation_result, dict) or not evaluation_result.get("ok", False):
+            return {"ok": False, "error": "evaluation_result is not successful; cannot run error analysis."}
         best = evaluation_result.get("best", {})
         metric = best.get("metric_name", "n/a")
         value = best.get("metric_value")
@@ -5966,7 +6431,7 @@ if __name__ == "__main__":
             findings.append("RMSE is relatively high; consider better features and robust models.")
         if not findings:
             findings.append("No critical issue detected from aggregate metrics. Validate with slice-level checks.")
-        return {"findings": findings}
+        return {"ok": True, "findings": findings}
 
     def generate_report(
         task: str,
@@ -5974,7 +6439,15 @@ if __name__ == "__main__":
         executed_steps: Optional[List[str]] = None,
         extra_notes: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
+        if not isinstance(evaluation_result, dict) or not evaluation_result.get("ok", False):
+            return {"ok": False, "error": "evaluation_result is not successful; report generation blocked."}
+        all_metrics = evaluation_result.get("all_metrics", [])
+        if not isinstance(all_metrics, list) or not all_metrics:
+            return {"ok": False, "error": "evaluation_result has no metrics; report generation blocked."}
         best = evaluation_result.get("best") or {"model": "N/A", "metric_name": "n/a", "metric_value": None}
+        evidence = evaluation_result.get("evidence", {}) if isinstance(evaluation_result.get("evidence", {}), dict) else {}
+        inputs = evidence.get("inputs", {}) if isinstance(evidence.get("inputs", {}), dict) else {}
+        stats = evidence.get("stats", {}) if isinstance(evidence.get("stats", {}), dict) else {}
         lines = [
             "# Model Report",
             "",
@@ -5982,6 +6455,10 @@ if __name__ == "__main__":
             f"- Objective: {evaluation_result.get('objective', 'maximize')}",
             f"- Best Model: {best['model']}",
             f"- Metric: {best['metric_name']}={best['metric_value']}",
+            f"- Data Path: {inputs.get('data_path', 'N/A')}",
+            f"- Target Column: {inputs.get('target_column', 'N/A')}",
+            f"- Rows (train/test): {stats.get('rows_train', 'N/A')}/{stats.get('rows_test', 'N/A')}",
+            f"- Feature Count: {stats.get('feature_count', 'N/A')}",
             "",
         ]
         if executed_steps:
@@ -5990,15 +6467,30 @@ if __name__ == "__main__":
                 lines.append(f"- {step}")
             lines.append("")
         lines.append("## Candidate Results")
-        for row in evaluation_result.get("all_metrics", []):
+        for row in all_metrics:
             lines.append(f"- {row['model']}: {row['metric_name']}={row['metric_value']}")
+            row_metrics = row.get("metrics", {})
+            if isinstance(row_metrics, dict):
+                for k, v in row_metrics.items():
+                    lines.append(f"  - {k}: {v}")
         if extra_notes:
             lines.append("")
             lines.append("## Notes")
             for note in extra_notes:
                 lines.append(f"- {note}")
         report_md = "\n".join(lines)
-        return {"report_markdown": report_md, "best_model": best["model"], "metrics": evaluation_result.get("all_metrics", [])}
+        report_dir = workspace_path / "reports"
+        report_dir.mkdir(parents=True, exist_ok=True)
+        report_path = report_dir / f"model_report_{now_ms()}.md"
+        report_path.write_text(report_md, encoding="utf-8")
+        return {
+            "ok": True,
+            "report_markdown": report_md,
+            "report_path": str(report_path),
+            "best_model": best["model"],
+            "metrics": all_metrics,
+            "evidence": evidence,
+        }
 
     def skill_install_from_git(repo_url: str, ref: Optional[str] = None, alias: Optional[str] = None) -> Dict[str, Any]:
         return skill_store.install_from_git(repo_url=repo_url, ref=ref, alias=alias)
@@ -6432,8 +6924,14 @@ if __name__ == "__main__":
         ToolSpec(
             name="process_data",
             func=process_data,
-            description="Create a data preprocessing plan.",
-            input_schema={"task": "string", "mode_hint": "classification|regression|null"},
+            description="Validate and profile a real CSV dataset for ML workflow readiness.",
+            input_schema={
+                "task": "string",
+                "mode_hint": "classification|regression|null",
+                "data_path": "string|null",
+                "target_column": "string|null",
+                "max_rows": "int",
+            },
             permission="data_exec",
             owner_agent="data_agent",
         )
@@ -6462,8 +6960,14 @@ if __name__ == "__main__":
         ToolSpec(
             name="tune_models",
             func=tune_models,
-            description="Suggest tuning gains and recommended models.",
-            input_schema={"task": "string", "models": "list[string]"},
+            description="Build parameter search plan for selected models using real dataset metadata.",
+            input_schema={
+                "task": "string",
+                "models": "list[string]",
+                "data_path": "string|null",
+                "target_column": "string|null",
+                "mode_hint": "classification|regression|null",
+            },
             permission="ml_train",
             owner_agent="trainer",
         )
@@ -6472,8 +6976,16 @@ if __name__ == "__main__":
         ToolSpec(
             name="train_models",
             func=train_models,
-            description="Run local simulated training and produce metrics.",
-            input_schema={"task": "string", "models": "list[string]"},
+            description="Run real local model training/evaluation on CSV dataset (requires scikit-learn).",
+            input_schema={
+                "task": "string",
+                "models": "list[string]",
+                "data_path": "string|null",
+                "target_column": "string|null",
+                "mode_hint": "classification|regression|null",
+                "test_size": "float",
+                "random_state": "int",
+            },
             permission="ml_train",
             owner_agent="trainer",
         )
@@ -6482,7 +6994,7 @@ if __name__ == "__main__":
         ToolSpec(
             name="evaluate_models",
             func=evaluate_models,
-            description="Evaluate model runs and pick best candidate.",
+            description="Evaluate completed training runs and pick best candidate.",
             input_schema={"task": "string", "train_result": "dict"},
             permission="ml_eval",
             owner_agent="evaluator",
@@ -6502,7 +7014,7 @@ if __name__ == "__main__":
         ToolSpec(
             name="generate_report",
             func=generate_report,
-            description="Generate markdown report from evaluation artifacts.",
+            description="Generate markdown report from verified evaluation artifacts and save file.",
             input_schema={"task": "string", "evaluation_result": "dict", "executed_steps": "list[string]|null"},
             permission="report_write",
             owner_agent="reporter",
