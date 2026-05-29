@@ -43,22 +43,32 @@ Harness = Tools + Knowledge + Observation + Action Interfaces + Permissions
 
 ## Main Features
 
-### Task Families
-- Knowledge lookup from local workspace content and ingested references.
-- Document reading and summarization for `.pdf`, `.docx`, `.txt`, `.md`.
-- Tabular analysis for `.csv`, `.xlsx`.
-- ML workflow blocks: preprocessing, model suggestion, tuning, training, evaluation, reporting.
-- Code-task actions: read/search/edit files and run shell commands.
-- Optional utility actions: network HTTP calls, sqlite queries, browser-like page inspection.
+### Advanced Agent Capabilities
+- Dynamic tool loop with structured action modes (`REASON/TOOL/CODE/CLARIFY/FINAL`) and step-wise verification.
+- Contract-guided execution with explicit precondition/postcondition checks before/after each tool call.
+- Failure-aware recovery with taxonomy-driven handling (`missing_input`, `parse_error`, `timeout`, `policy_block`, `command_missing`, `json_error`) and automatic replan/clarify paths.
+- Experience reflection and skill distillation: successful traces are summarized, quality-gated, deduplicated, and converted into reusable local skills.
+- Multimodal workspace understanding for documents, images (including SVG with embedded raster), and videos (frame sampling + vision summary).
 
-### Representative Tools
-- File/search: `list_workspace_files`, `search_workspace_text`, `read_text_file`, `write_text_file`
-- Document: `read_document_file`, `summarize_text`, `extract_key_points`
-- Tabular: `read_spreadsheet_preview`, `profile_tabular_columns`, `analyze_tabular_with_python`
-- Code: `read_code_file`, `read_code_span`, `replace_text_in_file`, `run_shell_command`
-- ML: `process_data`, `model_suggest`, `tune_models`, `train_models`, `evaluate_models`, `generate_report`
-- Knowledge: `kb_search`, `knowledge_ingest_workspace_docs`, `knowledge_list_sources`, `knowledge_get_doc`
-- Skills: `skill_install_from_git`, `skill_list_installed`
+### Complex Tooling (Selected)
+- Knowledge and retrieval pipeline:
+  - `knowledge_ingest_workspace_docs` + `kb_search` + `knowledge_get_doc` + `knowledge_list_sources`
+  - Purpose: build and query an in-workspace knowledge base instead of one-shot file reads.
+- Tabular analysis and computation pipeline:
+  - `read_spreadsheet_preview` + `profile_tabular_columns` + `analyze_tabular_with_python`
+  - Purpose: inspect schema/statistics and run ad-hoc pandas analysis inside the runtime boundary.
+- ML workflow pipeline (data-gated):
+  - `process_data` + `feature_plan` + `model_suggest` + `tune_models` + `train_models` + `evaluate_models` + `error_analyze` + `generate_report`
+  - Purpose: run an end-to-end ML path with explicit data path/target checks and report generation.
+- Code and execution pipeline:
+  - `read_code_file` + `read_code_span` + `replace_text_in_file` + `run_shell_command`
+  - Purpose: inspect/edit/run code as first-class agent actions with policy controls.
+- Browser-style interaction tools:
+  - `browser_open_page` + `browser_click_link` + `browser_find_text` + `browser_get_state`
+  - Purpose: support page-level navigation/state extraction when tasks require web-like traversal.
+- Multimodal file interpretation:
+  - `describe_image_file` for visual explanation of `.svg/.png/.jpg/...`
+  - `describe_video_file` for `.mp4/.mov/...` using sampled frames and media metadata.
 
 ## Code
 
@@ -112,6 +122,56 @@ The web app uses the same `MultiAgentSystem` runtime and tool execution flow.
 - `analyze data/logreg_dataset.csv`
 - `do you find this key d5bbc8180dba11ecb1e81171463288e9 in the json file`
 - `could you help me download a data we can run it for logistic regression model?`
+
+### 4) GAIA benchmark quick start
+
+```bash
+python3 benchmarks/gaia_runner.py \
+  --workspace . \
+  --dataset benchmarks/gaia_sample.jsonl \
+  --score-mode relaxed \
+  --output reports/gaia_benchmark_result.json
+```
+
+- Dataset supports JSON or JSONL.
+- Question keys: `question` / `prompt` / `task` / `input`.
+- Answer keys: `answer` / `gold` / `target` / `final_answer` / `ground_truth`.
+- Score modes: `exact`, `contains`, `relaxed`.
+
+Run full dataset with checkpointing and resume (local file):
+
+```bash
+python3 benchmarks/gaia_runner.py \
+  --workspace . \
+  --dataset /absolute/path/to/gaia.jsonl \
+  --score-mode relaxed \
+  --save-every 10 \
+  --resume \
+  --output reports/gaia_full_result.json
+```
+
+Run by shard (example: split 1-3000 into three jobs):
+
+```bash
+python3 benchmarks/gaia_runner.py --workspace . --dataset /absolute/path/to/gaia.jsonl --start-index 1 --end-index 1000 --output reports/gaia_shard_1.json
+python3 benchmarks/gaia_runner.py --workspace . --dataset /absolute/path/to/gaia.jsonl --start-index 1001 --end-index 2000 --output reports/gaia_shard_2.json
+python3 benchmarks/gaia_runner.py --workspace . --dataset /absolute/path/to/gaia.jsonl --start-index 2001 --end-index 3000 --output reports/gaia_shard_3.json
+```
+
+Run directly from Hugging Face:
+
+```bash
+python3 benchmarks/gaia_runner.py \
+  --workspace . \
+  --dataset hf://gaia-benchmark/GAIA \
+  --hf-split validation \
+  --resume \
+  --output reports/gaia_hf_result.json
+```
+
+Optional:
+- `--hf-config <name>` when the dataset has multiple configs.
+- `--hf-cache-dir <path>` to control HF cache location.
 
 ## Reliability and Safety
 
